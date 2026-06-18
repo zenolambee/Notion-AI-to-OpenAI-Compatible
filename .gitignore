@@ -8,3 +8,9 @@ data/
 threads/
 notion_account.json
 *.log
+
+# Private capture files (cookies, internal Notion payloads)
+network.txt
+business.txt
+config.example.json
+notion_account.json.example
