@@ -83,6 +83,12 @@ _META_REASONING_MARKERS = (
     "i should respond",
     "i will respond",
     "i can answer",
+    "let me write it directly",
+    "write it directly in the conversation",
+    "following many style guidelines",
+    "a long article in",
+    "style guidelines. let me",
+    "in the conversation. let me",
 )
 
 _HEADING_START_RE = re.compile(r"#{1,6}\s+\S")
@@ -151,23 +157,28 @@ def _strip_meta_reasoning(text: str) -> str:
         if idx >= 0:
             last_marker_end = max(last_marker_end, idx + len(marker))
 
-    if last_marker_end < 0:
-        return ""
+    # Search start: after the last marker, or from the beginning if no marker found.
+    search_start = last_marker_end if last_marker_end >= 0 else 0
+    tail = stripped[search_start:]
 
-    # Find the first sentence boundary after the last marker. The boundary is a
-    # period followed by whitespace and a capital letter, or a period directly
-    # followed by an uppercase letter (the "now.Cursor" leak pattern).
-    tail = stripped[last_marker_end:]
-    match = re.search(r"\.(?:\s+(?=[A-Z])|(?=[A-Z]))", tail)
+    # Find the first sentence boundary: period followed by uppercase letter
+    # (with or without whitespace). This handles patterns like:
+    #   "...conversation.Pernahkah kamu..." (no space)
+    #   "...now. Cursor sudah..." (with space)
+    #   "...concisely. I have got..." (with space)
+    match = re.search(r"\.\s*(?=[A-Z])", tail)
     if match:
-        start = last_marker_end + match.end()
+        start = search_start + match.end()
         candidate = stripped[start:].strip()
-        if candidate:
+        if candidate and len(candidate) > 30:
             return candidate
 
-    # Fallback: if there's no period-boundary, just drop everything up to the
-    # end of the last marker.
-    return stripped[last_marker_end:].strip()
+    # Fallback: if we found markers but no clean boundary, drop everything
+    # up to the end of the last marker.
+    if last_marker_end >= 0:
+        return stripped[last_marker_end:].strip()
+
+    return ""
 
 
 
