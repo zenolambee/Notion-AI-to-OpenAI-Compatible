@@ -459,7 +459,7 @@ async def _stream_openai(
 
 def create_app(settings: Settings | None = None) -> FastAPI:
     settings = settings or load_settings()
-    app = FastAPI(title="NotionChat", version="0.1.0")
+    app = FastAPI(title="NotionChat", version="0.2.0")
 
     def verify_key(authorization: str | None = Header(default=None)) -> None:
         if not authorization or not authorization.startswith("Bearer "):
