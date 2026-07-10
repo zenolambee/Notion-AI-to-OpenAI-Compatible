@@ -368,6 +368,47 @@ def looks_like_coding_task_prompt(prompt: str) -> bool:
     return looks_like_coding_task_text(tail)
 
 
+_CONTENT_GEN_HINTS = (
+    "strict format",
+    "output only the article",
+    "write a blog",
+    "write a coding tutorial",
+    "write a product review",
+    "write a listicle",
+    "write a first-person",
+    "write a brand-voice",
+    "markdown h1",
+    "professional blog content writer",
+    "cms publishing tool",
+    "x-content-generation",
+)
+
+
+def looks_like_content_generation_text(text: str) -> bool:
+    lower = text.lower()
+    return any(hint in lower for hint in _CONTENT_GEN_HINTS)
+
+
+def looks_like_content_generation_prompt(prompt: str) -> bool:
+    lower = prompt.lower()
+    tail = lower.rsplit("user:", 1)[-1] if "user:" in lower else lower
+    return looks_like_content_generation_text(tail)
+
+
+_BLOG_WRITER_SYSTEM = (
+    "You are a professional blog content writer. "
+    "Write the requested article in Markdown. "
+    "Output only the article body — no meta-commentary, role disclaimers, or refusals. "
+    "Do not mention Notion, assistants, or limitations."
+)
+
+_DEFAULT_ASSISTANT_SYSTEM = (
+    "You are a helpful assistant. Respond directly in the conversation. "
+    "Do not create, draft, or render Notion pages. "
+    "Answer inline in the conversation."
+)
+
+
 def infer_scaffold_command(user_request: str) -> str | None:
     lower = user_request.lower()
     if "next.js" in lower or "nextjs" in lower or re.search(r"\bnext\b", lower):
@@ -1157,6 +1198,7 @@ def prepare_chat_input(
     *,
     tools: list[dict[str, Any]] | None = None,
     tool_choice: str | dict[str, Any] | None = None,
+    content_mode: bool = False,
 ) -> tuple[str | None, str, bool, bool, list[dict[str, Any]]]:
     """Build (system, prompt, tools_active, ide_agent, tools) for Notion from OpenAI messages."""
     cursor_ide = is_ide_agent_messages(messages)
@@ -1166,11 +1208,7 @@ def prepare_chat_input(
     tools_active = bool(normalized_tools) and tool_choice != "none"
     ide_agent = tools_active and (is_ide_agent_tools(normalized_tools) or cursor_ide)
 
-    system_parts: list[str] = [
-        "You are a helpful assistant. Respond directly in the conversation. "
-        "Do not create, draft, or render Notion pages. "
-        "Answer inline in the conversation."
-    ]
+    system_parts: list[str] = []
     transcript_blocks: list[str] = []
     pending_tool_results: list[str] = []
 
@@ -1250,6 +1288,24 @@ def prepare_chat_input(
 
     if not transcript_blocks:
         raise NotionChatError("No user message in request", status_code=400)
+
+    if not content_mode and not tools_active:
+        for msg in messages:
+            role = getattr(msg, "role", None) or (msg.get("role") if isinstance(msg, dict) else None)
+            if role != "user":
+                continue
+            content = getattr(msg, "content", None)
+            if content is None and isinstance(msg, dict):
+                content = msg.get("content")
+            text = _extract_text(content).strip()
+            if text and looks_like_content_generation_text(text):
+                content_mode = True
+                break
+
+    if content_mode and not tools_active:
+        system_parts.insert(0, _BLOG_WRITER_SYSTEM)
+    else:
+        system_parts.insert(0, _DEFAULT_ASSISTANT_SYSTEM)
 
     if tools_active:
         system_parts.append(

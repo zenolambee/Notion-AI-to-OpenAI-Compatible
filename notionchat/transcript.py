@@ -239,3 +239,41 @@ def build_inference_request(
             "spaceId": acc.space_id,
         }
     return body
+
+
+def build_confirm_request(
+    acc: NotionAccount,
+    *,
+    thread_id: str,
+    tool_result_entries: list[dict[str, Any]],
+    trace_id: str | None = None,
+) -> dict[str, Any]:
+    """Build a request that auto-approves pending tool confirmations (e.g. web-search
+    URL-safety prompts) so the agent can continue without a human clicking "Allow".
+    """
+    confirm_ids = [e["id"] for e in tool_result_entries if isinstance(e.get("id"), str)]
+    return {
+        "traceId": trace_id or new_uuid(),
+        "spaceId": acc.space_id,
+        "transcript": tool_result_entries,
+        "threadId": thread_id,
+        "createThread": False,
+        "isPartialTranscript": True,
+        "generateTitle": False,
+        "saveAllThreadOperations": False,
+        "setUnreadState": False,
+        "threadType": "workflow",
+        "asPatchResponse": True,
+        "patchResponseVersion": 2,
+        "hasHeartbeat": False,
+        "createdSource": "ai_module",
+        "isUserInAnySalesAssistedSpace": False,
+        "isSpaceSalesAssisted": False,
+        "confirmToolStepIds": confirm_ids,
+        "debugOverrides": {
+            "emitAgentSearchExtractedResults": True,
+            "cachedInferences": {},
+            "annotationInferences": {},
+            "emitInferences": False,
+        },
+    }

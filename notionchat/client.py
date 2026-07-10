@@ -8,7 +8,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from notionchat.account import NotionAccount, build_cookie_header
+from notionchat.account import NotionAccount
+from notionchat.browser_fp import build_notion_request_headers
 from notionchat.exceptions import NotionChatError
 from notionchat.models import get_cached_alias_map, normalize_request_model, resolve_model
 from notionchat.ndjson import NDJSONStreamParser, clean_notion_output_text
@@ -17,6 +18,7 @@ from notionchat.thread_state import ThreadState, load_thread_state, save_thread_
 from notionchat.tools import merge_tool_calls
 from notionchat.transcript import (
     _now_iso,
+    build_confirm_request,
     build_full_transcript,
     build_inference_request,
     build_partial_transcript,
@@ -24,6 +26,8 @@ from notionchat.transcript import (
 )
 
 log = logging.getLogger(__name__)
+
+MAX_AUTO_CONFIRM_ROUNDS = 3
 
 
 async def _safe_close_response(resp) -> None:
@@ -58,25 +62,7 @@ class ChatResult:
 
 
 def build_headers(acc: NotionAccount, *, accept: str = "application/x-ndjson") -> dict[str, str]:
-    return {
-        "accept": accept,
-        "accept-language": "en-US,en;q=0.9",
-        "content-type": "application/json",
-        "notion-audit-log-platform": "web",
-        "notion-client-version": acc.client_version,
-        "origin": "https://app.notion.com",
-        "referer": "https://app.notion.com/ai",
-        "user-agent": acc.user_agent,
-        "x-notion-active-user-header": acc.user_id,
-        "x-notion-space-id": acc.space_id,
-        "sec-ch-ua": '"Google Chrome";v="149", "Chromium";v="149", "Not)A;Brand";v="24"',
-        "sec-ch-ua-mobile": "?0",
-        "sec-ch-ua-platform": '"Windows"',
-        "sec-fetch-dest": "empty",
-        "sec-fetch-mode": "cors",
-        "sec-fetch-site": "same-origin",
-        "cookie": build_cookie_header(acc),
-    }
+    return build_notion_request_headers(acc, accept=accept)
 
 
 class NotionAIClient:
@@ -248,6 +234,61 @@ class NotionAIClient:
         finally:
             await _safe_close_response(resp)
 
+    async def _auto_confirm_pending(
+        self,
+        *,
+        parser: NDJSONStreamParser,
+        headers: dict[str, str],
+        active_thread_id: str,
+        on_delta: Callable[[str], None] | None = None,
+    ) -> None:
+        """Auto-approve Notion's "confirmation required" tool prompts (e.g. web-search
+        URL-safety checks) so the agent doesn't stall waiting for a manual click.
+        """
+        client = self._get_client()
+        url = f"{self.base_url}/runInferenceTranscript"
+        last_emitted_clean = clean_notion_output_text(parser.text)
+        for _ in range(MAX_AUTO_CONFIRM_ROUNDS):
+            pending = parser.pop_pending_confirmations()
+            if not pending:
+                return
+            log.info(
+                "Auto-confirming %d pending tool confirmation(s) on thread %s",
+                len(pending),
+                active_thread_id,
+            )
+            body = build_confirm_request(
+                self.account,
+                thread_id=active_thread_id,
+                tool_result_entries=pending,
+            )
+            resp = None
+            try:
+                resp = await client.post_stream(url, json=body, headers=headers)
+                if resp.status_code != 200:
+                    log.warning(
+                        "Auto-confirm request failed (%s): %s",
+                        resp.status_code,
+                        (await resp.atext())[:300],
+                    )
+                    return
+                async for line in resp.aiter_lines():
+                    if isinstance(line, bytes):
+                        line = line.decode("utf-8", errors="replace")
+                    parser.feed_line(line)
+                    if on_delta:
+                        cleaned = clean_notion_output_text(parser.text)
+                        if cleaned and len(cleaned) > len(last_emitted_clean):
+                            delta = cleaned[len(last_emitted_clean) :]
+                            on_delta(delta)
+                            last_emitted_clean = cleaned
+            except Exception:
+                log.exception("Auto-confirm request errored; leaving response as-is")
+                return
+            finally:
+                if resp is not None:
+                    await _safe_close_response(resp)
+
     async def _run_inference(
         self,
         *,
@@ -275,6 +316,12 @@ class NotionAIClient:
             if resp.status_code != 200:
                 self._raise_http(resp.status_code, await resp.atext())
             await self._consume_stream(resp, parser, on_delta=on_delta)
+            await self._auto_confirm_pending(
+                parser=parser,
+                headers=headers,
+                active_thread_id=active_thread_id,
+                on_delta=on_delta,
+            )
         except NotionHttpStatusError as e:
             self._raise_http(e.status_code, e.body)
         except NotionChatError:
@@ -389,6 +436,22 @@ class NotionAIClient:
                     if cleaned and len(cleaned) > len(last_emitted_clean):
                         delta = cleaned[len(last_emitted_clean) :]
                         await queue.put(delta)
+                        last_emitted_clean = cleaned
+
+                if parser.pending_tool_confirmations:
+
+                    def _emit(delta: str) -> None:
+                        nonlocal last_emitted_clean
+                        # queue.put is a coroutine; schedule it without blocking the
+                        # sync callback interface shared with the non-streaming path.
+                        asyncio.get_event_loop().create_task(queue.put(delta))
+
+                    await self._auto_confirm_pending(
+                        parser=parser,
+                        headers=headers,
+                        active_thread_id=active_thread_id,
+                        on_delta=_emit,
+                    )
             except BaseException as e:
                 http_error.append(e)
             finally:

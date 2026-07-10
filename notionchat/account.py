@@ -20,10 +20,10 @@ class NotionAccount:
     space_view_id: str = ""
     browser_id: str = ""
     device_id: str = ""
-    client_version: str = "23.13.20260616.2105"
+    client_version: str = "23.13.20260710.0022"
     user_agent: str = (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-        "(KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36"
+        "(KHTML, like Gecko) Chrome/150.0.0.0 Safari/537.36"
     )
     timezone: str = "America/Los_Angeles"
     default_model: str = "ambrosia-tart-high"
@@ -76,8 +76,9 @@ def save_notion_account(acc: NotionAccount, path: Path | str) -> None:
 
 
 def build_cookie_header(acc: NotionAccount) -> str:
+    """Prefer the full browser cookie string; fall back to a minimal session."""
     if acc.full_cookie:
-        return acc.full_cookie
+        return acc.full_cookie.strip().rstrip(";")
     parts = [
         f"notion_browser_id={acc.browser_id}",
         f"device_id={acc.device_id}",

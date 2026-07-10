@@ -50,9 +50,13 @@ def cmd_init(args: argparse.Namespace) -> int:
             cookie,
             space_name=args.space_name,
             account_path=args.account,
+            user_agent=args.user_agent,
+            client_version=args.client_version,
         )
         print(f"Saved account for workspace {acc.space_name!r} ({acc.space_id})")
         print(f"  user: {acc.user_name or acc.user_id}")
+        print(f"  client_version: {acc.client_version}")
+        print(f"  user_agent: {acc.user_agent[:80]}...")
         print(f"  file: {args.account}")
 
     asyncio.run(run())
@@ -88,6 +92,16 @@ def main(argv: list[str] | None = None) -> int:
     init_p.add_argument("--cookie", required=True, help='Full document.cookie string, or "-" for stdin')
     init_p.add_argument("--space-name", default=None, help="Workspace name when multiple exist")
     init_p.add_argument("--account", default="notion_account.json", help="Output account file path")
+    init_p.add_argument(
+        "--user-agent",
+        default=None,
+        help="Browser User-Agent from DevTools (Network → any Notion request)",
+    )
+    init_p.add_argument(
+        "--client-version",
+        default=None,
+        help="notion-client-version header from DevTools (e.g. 23.13.20260710.0022)",
+    )
     init_p.set_defaults(func=cmd_init)
 
     args = parser.parse_args(argv)

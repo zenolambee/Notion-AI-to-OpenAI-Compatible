@@ -8,10 +8,15 @@ from typing import Any
 from curl_cffi import requests
 
 from notionchat.account import NotionAccount, parse_browser_cookie, save_notion_account
+from notionchat.browser_fp import (
+    DEFAULT_CLIENT_VERSION,
+    DEFAULT_USER_AGENT,
+    build_notion_request_headers,
+    fingerprint_kwargs,
+)
 from notionchat.exceptions import NotionChatError
 
 BASE_URL = "https://app.notion.com/api/v3"
-DEFAULT_CLIENT_VERSION = "23.13.20260616.2105"
 
 
 @dataclass(slots=True, frozen=True)
@@ -20,24 +25,6 @@ class Workspace:
     space_view_id: str
     space_name: str
     domain: str = ""
-
-
-def _bootstrap_headers(token_v2: str, browser_id: str, user_id: str | None) -> dict[str, str]:
-    parts = [f"notion_browser_id={browser_id}"]
-    if user_id:
-        parts.append(f"notion_user_id={user_id}")
-        parts.append(f'notion_users=[%22{user_id}%22]')
-    parts.extend(["notion_check_cookie_consent=false", f"token_v2={token_v2}"])
-    cookie = "; ".join(parts)
-    return {
-        "accept": "application/json",
-        "content-type": "application/json",
-        "notion-audit-log-platform": "web",
-        "notion-client-version": DEFAULT_CLIENT_VERSION,
-        "origin": "https://app.notion.com",
-        "referer": "https://app.notion.com/",
-        "cookie": cookie,
-    }
 
 
 def _extract_user(record_map: dict[str, Any], user_id: str) -> tuple[str, str]:
@@ -50,7 +37,13 @@ def _extract_user(record_map: dict[str, Any], user_id: str) -> tuple[str, str]:
     return name, email
 
 
-def _fetch_load_user_content(cookie: str) -> tuple[dict[str, Any], str, str | None, str, str]:
+def _fetch_load_user_content(
+    cookie: str,
+    *,
+    user_agent: str | None = None,
+    client_version: str | None = None,
+    impersonate: str | None = None,
+) -> tuple[dict[str, Any], str, str | None, str, str]:
     """Call Notion loadUserContent and return parsed session fields."""
     parsed = parse_browser_cookie(cookie)
     token = parsed.get("token_v2")
@@ -60,13 +53,28 @@ def _fetch_load_user_content(cookie: str) -> tuple[dict[str, Any], str, str | No
     user_id = parsed.get("notion_user_id") or None
     browser_id = parsed.get("notion_browser_id") or str(uuid.uuid4())
     device_id = parsed.get("device_id") or str(uuid.uuid4())
+    fp = fingerprint_kwargs(user_agent=user_agent, client_version=client_version)
 
-    headers = _bootstrap_headers(token, browser_id, user_id)
+    probe = NotionAccount(
+        token_v2=token,
+        full_cookie=cookie.strip().rstrip(";"),
+        user_id=user_id or "",
+        browser_id=browser_id,
+        device_id=device_id,
+        client_version=fp["client_version"],
+        user_agent=fp["user_agent"],
+        extras={"sec_ch_ua": fp["sec_ch_ua"]},
+    )
+    headers = build_notion_request_headers(
+        probe,
+        accept="application/json",
+        referer="https://app.notion.com/",
+    )
     resp = requests.post(
         f"{BASE_URL}/loadUserContent",
         json={"cursor": {"stack": []}, "limit": 100},
         headers=headers,
-        impersonate="chrome",
+        impersonate=impersonate or fp["impersonate"],
         timeout=30.0,
     )
     if resp.status_code != 200:
@@ -123,12 +131,20 @@ def bootstrap_from_cookie_sync(
     *,
     space_name: str | None = None,
     account_path: str = "notion_account.json",
+    user_agent: str | None = None,
+    client_version: str | None = None,
 ) -> NotionAccount:
     """Sync variant used during server startup when space_id is missing."""
-    data, token, user_id, browser_id, device_id = _fetch_load_user_content(cookie)
+    fp = fingerprint_kwargs(user_agent=user_agent, client_version=client_version)
+    data, token, user_id, browser_id, device_id = _fetch_load_user_content(
+        cookie,
+        user_agent=fp["user_agent"],
+        client_version=fp["client_version"],
+        impersonate=fp["impersonate"],
+    )
 
     return _account_from_load_user_content(
-        cookie=cookie,
+        cookie=cookie.strip().rstrip(";"),
         data=data,
         token=token,
         user_id=user_id,
@@ -136,6 +152,9 @@ def bootstrap_from_cookie_sync(
         device_id=device_id,
         space_name=space_name,
         account_path=account_path,
+        user_agent=fp["user_agent"],
+        client_version=fp["client_version"],
+        sec_ch_ua=fp["sec_ch_ua"],
     )
 
 
@@ -149,6 +168,9 @@ def _account_from_load_user_content(
     device_id: str,
     space_name: str | None,
     account_path: str,
+    user_agent: str = DEFAULT_USER_AGENT,
+    client_version: str = DEFAULT_CLIENT_VERSION,
+    sec_ch_ua: str | None = None,
 ) -> NotionAccount:
     record_map = data.get("recordMap") or {}
     if not user_id:
@@ -178,6 +200,10 @@ def _account_from_load_user_content(
             status_code=400,
         )
 
+    extras: dict[str, Any] = {}
+    if sec_ch_ua:
+        extras["sec_ch_ua"] = sec_ch_ua
+
     acc = NotionAccount(
         token_v2=token,
         full_cookie=cookie,
@@ -189,7 +215,9 @@ def _account_from_load_user_content(
         space_view_id=chosen.space_view_id,
         browser_id=browser_id,
         device_id=device_id,
-        client_version=DEFAULT_CLIENT_VERSION,
+        client_version=client_version,
+        user_agent=user_agent,
+        extras=extras,
     )
     save_notion_account(acc, account_path)
     return acc
@@ -200,10 +228,14 @@ async def bootstrap_from_cookie(
     *,
     space_name: str | None = None,
     account_path: str = "notion_account.json",
+    user_agent: str | None = None,
+    client_version: str | None = None,
 ) -> NotionAccount:
     return await asyncio.to_thread(
         bootstrap_from_cookie_sync,
         cookie,
         space_name=space_name,
         account_path=account_path,
+        user_agent=user_agent,
+        client_version=client_version,
     )

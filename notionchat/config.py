@@ -13,6 +13,7 @@ from notionchat.account import (
     save_notion_account,
 )
 from notionchat.bootstrap import bootstrap_from_cookie_sync
+from notionchat.browser_fp import DEFAULT_CLIENT_VERSION, DEFAULT_USER_AGENT
 from notionchat.exceptions import NotionChatError
 
 load_dotenv()
@@ -39,7 +40,7 @@ def load_settings() -> Settings:
     return Settings(
         api_key=os.getenv("NOTIONCHAT_API_KEY", "sk-notionchat"),
         host=os.getenv("NOTIONCHAT_HOST", "127.0.0.1"),
-        port=int(os.getenv("NOTIONCHAT_PORT", "8787")),
+        port=int(os.getenv("NOTIONCHAT_PORT", "1994")),
         account_path=_env_path("NOTIONCHAT_ACCOUNT", "notion_account.json"),
         thread_state_dir=_env_path("NOTIONCHAT_THREADS_DIR", "threads"),
         base_url=os.getenv("NOTIONCHAT_NOTION_BASE_URL", DEFAULT_BASE_URL).rstrip("/"),
@@ -61,17 +62,33 @@ def _cookie_identity_changed(acc: NotionAccount, cookie: str) -> bool:
     return False
 
 
+def _apply_fingerprint_env(acc: NotionAccount) -> NotionAccount:
+    ua = os.getenv("NOTION_USER_AGENT", "").strip()
+    cv = os.getenv("NOTION_CLIENT_VERSION", "").strip()
+    sec = os.getenv("NOTION_SEC_CH_UA", "").strip()
+    extras = dict(acc.extras)
+    if sec:
+        extras["sec_ch_ua"] = sec
+    return replace(
+        acc,
+        user_agent=ua or acc.user_agent or DEFAULT_USER_AGENT,
+        client_version=cv or acc.client_version or DEFAULT_CLIENT_VERSION,
+        extras=extras,
+    )
+
+
 def _refresh_cookie(acc: NotionAccount, cookie: str) -> NotionAccount:
     parsed = parse_browser_cookie(cookie)
     token = parsed.get("token_v2") or acc.token_v2
-    return replace(
+    acc = replace(
         acc,
-        full_cookie=cookie,
+        full_cookie=cookie.strip().rstrip(";"),
         token_v2=token,
         user_id=parsed.get("notion_user_id") or acc.user_id,
         browser_id=parsed.get("notion_browser_id") or acc.browser_id,
         device_id=parsed.get("device_id") or acc.device_id,
     )
+    return _apply_fingerprint_env(acc)
 
 
 def load_account_from_env(settings: Settings) -> NotionAccount:
@@ -98,7 +115,7 @@ def load_account_from_env(settings: Settings) -> NotionAccount:
                 "Account file is missing space_id. Run: python -m notionchat init --cookie \"...\"",
                 status_code=500,
             )
-        return acc
+        return _apply_fingerprint_env(acc)
 
     if cookie:
         return bootstrap_from_cookie_sync(

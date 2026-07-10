@@ -121,7 +121,7 @@
   "variable": [
     {
       "key": "base_url",
-      "value": "http://127.0.0.1:8787"
+      "value": "http://127.0.0.1:1994"
     },
     {
       "key": "api_key",

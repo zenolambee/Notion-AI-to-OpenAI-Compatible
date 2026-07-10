@@ -100,6 +100,7 @@ class NDJSONParseResult:
     line_count: int = 0
     event_type_counts: dict[str, int] = field(default_factory=dict)
     tool_calls: list[dict[str, Any]] = field(default_factory=list)
+    pending_tool_confirmations: list[dict[str, Any]] = field(default_factory=list)
 
 
 def _looks_like_search_preamble(fragment: str) -> bool:
@@ -219,7 +220,29 @@ def clean_notion_output_text(text: str) -> str:
     ) and not _HEADING_START_RE.search(stripped):
         return ""
 
-    return stripped
+    return _repair_missing_whitespace(stripped)
+
+
+_MISSING_SPACE_RE = re.compile(r"([a-z0-9\)\"'])([.!?])([A-Z])")
+_MISSING_BULLET_BREAK_RE = re.compile(r"([.!?:])-\s?(?=[A-Z])")
+
+
+def _repair_missing_whitespace(text: str) -> str:
+    """Fix runs where Notion's block-join drops the separator between blocks.
+
+    When Notion streams a reply as multiple content blocks (e.g. separate
+    bullet-list items or paragraphs), the blocks are concatenated with no
+    delimiter, producing artifacts like "literally.If you want" or
+    "works:- A clearly labeled...- A real script...". This restores a
+    minimal, safe separator without touching normal prose.
+    """
+    if not text:
+        return text
+    # "word.Next" -> "word. Next" (missing space after sentence end)
+    text = _MISSING_SPACE_RE.sub(lambda m: f"{m.group(1)}{m.group(2)} {m.group(3)}", text)
+    # "works:- Item" or "literally.- Item" -> newline before the bullet dash
+    text = _MISSING_BULLET_BREAK_RE.sub(lambda m: f"{m.group(1)}\n- ", text)
+    return text
 
 def _is_int(value: Any) -> bool:
     return isinstance(value, int) and not isinstance(value, bool)
@@ -240,6 +263,8 @@ class NDJSONStreamParser:
         self._value_counts: dict[str, int] = {}
         self._section_count = 0
         self._tool_use_state: dict[str, dict[str, Any]] = {}
+        self.pending_tool_confirmations: list[dict[str, Any]] = []
+        self._seen_confirmation_ids: set[str] = set()
 
     @property
     def text(self) -> str:
@@ -321,7 +346,25 @@ class NDJSONStreamParser:
             line_count=self.line_count,
             event_type_counts=dict(self.event_type_counts),
             tool_calls=list(self.tool_calls),
+            pending_tool_confirmations=list(self.pending_tool_confirmations),
         )
+
+    def pop_pending_confirmations(self) -> list[dict[str, Any]]:
+        pending = self.pending_tool_confirmations
+        self.pending_tool_confirmations = []
+        return pending
+
+    def _register_confirmation_entry(self, entry: dict[str, Any]) -> None:
+        if entry.get("type") != "agent-tool-result":
+            return
+        if entry.get("state") != "confirmation:requested" and not entry.get("requestedConfirmation"):
+            return
+        entry_id = entry.get("id")
+        if not isinstance(entry_id, str) or entry_id in self._seen_confirmation_ids:
+            return
+        self._seen_confirmation_ids.add(entry_id)
+        self.pending_tool_confirmations.append(entry)
+
     def _tool_prefix(self, path: str) -> str | None:
         if "/value/" not in path:
             return None
@@ -381,7 +424,10 @@ class NDJSONStreamParser:
             self._raise_premium_unavailable(entry)
         if sub_type == "trust-rule-denied":
             raise NotionChatError(
-                f"{message} Paste a fresh cookie from app.notion.com after opening Notion AI in the browser.",
+                f"{message} Re-run init on this machine with the full browser cookie from "
+                "app.notion.com (DevTools → Application → Cookies). Ensure notion-client-version "
+                "and User-Agent match your browser — set NOTION_USER_AGENT / NOTION_CLIENT_VERSION "
+                "in .env if needed.",
                 status_code=403,
             )
         raise NotionChatError(
@@ -399,6 +445,7 @@ class NDJSONStreamParser:
                         self._raise_premium_unavailable(entry)
                     if entry.get("type") == "error":
                         self._raise_inference_error(entry)
+                    self._register_confirmation_entry(entry)
             self._section_count = len(s)
             for i, sec in enumerate(s):
                 self._value_counts.setdefault(f"/s/{i}", 0)
@@ -423,7 +470,12 @@ class NDJSONStreamParser:
         if o == "a" and p == "/s/-" and isinstance(v, dict):
             section_idx = self._section_count
             self._section_count += 1
+            self._register_confirmation_entry(v)
             self._absorb_inline_section(section_idx, v)
+            return
+
+        if o in ("a", "p") and re.fullmatch(r"/s/\d+", p) and isinstance(v, dict):
+            self._register_confirmation_entry(v)
             return
 
         if o in ("a", "p") and "/value/" in p and isinstance(v, dict):

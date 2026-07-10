@@ -15,6 +15,11 @@ DEFAULT_MODEL_MAP: dict[str, str] = {
     "gpt-5.2": "oatmeal-cookie",
     "gpt-5.4": "oval-kumquat-medium",
     "gpt-5.5": "opal-quince-medium",
+    "gpt-5.6-terra": "orchid-muffin",
+    "gpt-5.6-sol": "orange-mousse",
+    "gpt-5.6-luna": "olive-jellyroll",
+    "grok-4.5": "strawberry-whoopiepie",
+    "grok-4.3": "xigua-mochi-medium",
     "opus-4.8": "ambrosia-tart-high",
     "opus-4.7": "apricot-sorbet-high",
     "opus-4.6": "avocado-froyo-medium",
@@ -54,7 +59,8 @@ def parse_available_models(response: dict[str, Any]) -> dict[str, str]:
         primary = friendly_alias(msg)
         if not primary:
             continue
-        aliases = {primary, mid}
+        exact = msg.strip()
+        aliases = {primary, mid, exact}
         if primary.startswith("claude-"):
             aliases.add(primary.removeprefix("claude-"))
         for short in (
@@ -65,10 +71,15 @@ def parse_available_models(response: dict[str, Any]) -> dict[str, str]:
             "haiku-4.5",
             "gemini-3-flash",
             "gemini-2.5-flash",
+            "gpt-5.6-terra",
+            "gpt-5.6-sol",
+            "gpt-5.6-luna",
             "gpt-5.5",
             "gpt-5.4",
             "gpt-5.2",
             "gpt-4o",
+            "grok-4.5",
+            "grok-4.3",
             "minimax-m2.5",
         ):
             if short in primary:
@@ -92,12 +103,16 @@ def list_openai_models_from_notion(
     *,
     default_notion_id: str,
 ) -> list[dict[str, Any]]:
-    """Build OpenAI /v1/models list — one entry per enabled Notion model only."""
+    """Build OpenAI /v1/models list — one entry per enabled Notion model only.
+
+    Uses Notion's exact ``modelMessage`` (e.g. ``Grok 4.5``, ``GPT-5.6 Terra``) as
+    the OpenAI model ``id`` so clients show the same title as Notion's model picker.
+    """
     del default_notion_id  # kept for API compatibility
 
     models: list[dict[str, Any]] = []
-    seen_ids: set[str] = set()
     seen_notion_ids: set[str] = set()
+    seen_ids: set[str] = set()
 
     for entry in response.get("models") or []:
         if not isinstance(entry, dict) or entry.get("isDisabled"):
@@ -109,7 +124,7 @@ def list_openai_models_from_notion(
         if notion_id in seen_notion_ids:
             continue
 
-        model_id = friendly_alias(msg)
+        model_id = msg.strip()
         if not model_id or model_id in seen_ids:
             continue
 
@@ -117,7 +132,7 @@ def list_openai_models_from_notion(
         seen_notion_ids.add(notion_id)
         models.append(_openai_model_entry(model_id))
 
-    models.sort(key=lambda item: item["id"])
+    models.sort(key=lambda item: item["id"].lower())
     return models
 
 
@@ -154,13 +169,15 @@ def get_cached_alias_map() -> dict[str, str] | None:
 
 
 def normalize_request_model(model: str | None) -> str | None:
-    """Strip router prefixes like `notion/opus-4.8` → `opus-4.8`."""
+    """Strip router prefixes like `notion/opus-4.8` → `opus-4.8`, then normalize spacing."""
     if not model:
         return model
     cleaned = model.strip()
     while "/" in cleaned:
         cleaned = cleaned.rsplit("/", 1)[-1].strip()
-    return cleaned or model
+    if not cleaned:
+        return model
+    return friendly_alias(cleaned)
 
 
 def _lookup_model(name: str | None, mapping: dict[str, str]) -> str | None:
@@ -220,6 +237,18 @@ def resolve_model(model: str | None, *, default: str, alias_map: dict[str, str] 
         hit = _lookup_model("haiku-4.5", dynamic) or _lookup_model("haiku-4.5", DEFAULT_MODEL_MAP)
         if hit:
             return hit
+    if "grok" in lower:
+        for key in ("grok-4.5", "grok-4.3", "grok-build-0.1"):
+            if key in lower:
+                hit = _lookup_model(key, dynamic) or _lookup_model(key, DEFAULT_MODEL_MAP)
+                if hit:
+                    return hit
+    if "gpt-5.6" in lower or "5.6-" in lower:
+        for key in ("gpt-5.6-terra", "gpt-5.6-sol", "gpt-5.6-luna"):
+            if key in lower:
+                hit = _lookup_model(key, dynamic) or _lookup_model(key, DEFAULT_MODEL_MAP)
+                if hit:
+                    return hit
 
     log.warning("Unknown model %r — passing through to Notion", model)
     return model

@@ -457,9 +457,82 @@ async def _stream_openai(
         await client.aclose()
 
 
+import os
+import sys
+import asyncio
+from contextlib import asynccontextmanager
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    loop = asyncio.get_running_loop()
+    # Save the original exception handler if set
+    original_handler = loop.get_exception_handler()
+
+    def win_fatal_loop_exception_handler(loop, context):
+        exception = context.get("exception")
+        message = context.get("message", "")
+        
+        is_fatal = False
+        if exception:
+            winerr = getattr(exception, "winerror", None)
+            if winerr in (121, 10053, 10054):
+                is_fatal = True
+            else:
+                err_msg = str(exception)
+                if any(code in err_msg for code in ("[WinError 121]", "[WinError 10054]", "[WinError 10053]")):
+                    is_fatal = True
+                elif isinstance(exception, (ConnectionResetError, ConnectionAbortedError)):
+                    is_fatal = True
+        elif "event loop self pipe" in message or "SelectorThread" in message:
+            is_fatal = True
+
+        if is_fatal:
+            log.critical(
+                "Fatal Windows event loop socket/pipe error detected (caused by PC waking up from hibernation/sleep). "
+                "The event loop has been corrupted and cannot recover. Terminating process immediately to prevent hang... "
+                "Exception: %s, Message: %s",
+                exception,
+                message,
+            )
+            os._exit(1)
+
+        if original_handler:
+            original_handler(loop, context)
+        else:
+            loop.default_exception_handler(context)
+
+    loop.set_exception_handler(win_fatal_loop_exception_handler)
+
+    settings = getattr(app.state, "settings", None)
+    if settings is not None:
+        try:
+            account = load_account_from_env(settings)
+            settings.thread_state_dir.mkdir(parents=True, exist_ok=True)
+            client = NotionAIClient(
+                account,
+                base_url=settings.base_url,
+                thread_state_dir=settings.thread_state_dir,
+            )
+            try:
+                raw = await client.fetch_available_models()
+                data = list_openai_models_from_notion(
+                    raw,
+                    default_notion_id=settings.default_model,
+                )
+                cache_openai_models(data, parse_available_models(raw))
+                log.info("Prefetched %d Notion model aliases on startup", len(data))
+            finally:
+                await client.aclose()
+        except Exception as e:
+            log.warning("Could not prefetch Notion models on startup: %s", e)
+
+    yield
+
+
 def create_app(settings: Settings | None = None) -> FastAPI:
     settings = settings or load_settings()
-    app = FastAPI(title="NotionChat", version="0.2.0")
+    app = FastAPI(title="NotionChat", version="0.2.0", lifespan=lifespan)
+    app.state.settings = settings
 
     def verify_key(authorization: str | None = Header(default=None)) -> None:
         if not authorization or not authorization.startswith("Bearer "):
@@ -509,13 +582,16 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     async def chat_completions(
         req: ChatCompletionRequest,
         _: None = Depends(verify_key),
+        x_content_generation: str | None = Header(None, alias="X-Content-Generation"),
     ) -> Any:
         try:
             tools = normalize_tools(_tools_payload(req))
+            content_mode = bool(x_content_generation)
             system, prompt, tools_active, ide_agent, tools = prepare_chat_input(
                 req.messages,
                 tools=tools,
                 tool_choice=req.tool_choice,
+                content_mode=content_mode,
             )
             if not tools and is_ide_agent_messages(req.messages):
                 log.warning("Cursor-like request but tools[] empty after prepare_chat_input")

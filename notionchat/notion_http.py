@@ -7,9 +7,10 @@ from typing import Any
 
 from curl_cffi.requests import AsyncSession, Response
 
+from notionchat.browser_fp import impersonate_for_user_agent
+
 log = logging.getLogger(__name__)
 
-BROWSER_IMPERSONATE = "chrome"
 DEFAULT_TIMEOUT = 300.0
 
 
@@ -102,11 +103,17 @@ class NotionHttpClient:
     closed after the response is consumed.
     """
 
-    def __init__(self, *, timeout: float = DEFAULT_TIMEOUT) -> None:
+    def __init__(self, *, timeout: float = DEFAULT_TIMEOUT, impersonate: str | None = None) -> None:
         self._timeout = timeout
+        self._impersonate = impersonate
 
     async def aclose(self) -> None:
         return
+
+    def _resolve_impersonate(self, headers: dict[str, str]) -> str:
+        if self._impersonate:
+            return self._impersonate
+        return impersonate_for_user_agent(headers.get("user-agent", ""))
 
     async def _request(
         self,
@@ -118,13 +125,15 @@ class NotionHttpClient:
         stream: bool,
     ) -> NotionStreamResponse:
         session = AsyncSession(timeout=self._timeout)
+        impersonate = self._resolve_impersonate(headers)
+        log.debug("Notion HTTP impersonate=%s ua=%s", impersonate, headers.get("user-agent", "")[:60])
         try:
             resp = await session.request(
                 method,
                 url,
                 json=json,
                 headers=headers,
-                impersonate=BROWSER_IMPERSONATE,
+                impersonate=impersonate,
                 stream=stream,
             )
             return NotionStreamResponse(resp, session)

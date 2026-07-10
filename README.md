@@ -73,7 +73,7 @@ Edit `.env`:
 |----------|-------------|
 | `NOTIONCHAT_API_KEY` | Bearer token clients must send (`Authorization: Bearer ...`) |
 | `NOTIONCHAT_HOST` | Bind host (default `127.0.0.1`) |
-| `NOTIONCHAT_PORT` | Port (default `8787`) |
+| `NOTIONCHAT_PORT` | Port (default `1994`) |
 | `NOTIONCHAT_ACCOUNT` | Path to account JSON (default `notion_account.json`) |
 | `NOTIONCHAT_THREADS_DIR` | Thread state directory (default `threads/`) |
 | `NOTIONCHAT_DEFAULT_MODEL` | Default Notion model ID |
@@ -105,17 +105,17 @@ Alternatively, set `NOTION_COOKIE` in `.env` and NotionChat will bootstrap on fi
 python -m notionchat serve
 ```
 
-Server URL: `http://127.0.0.1:8787`
+Server URL: `http://127.0.0.1:1994`
 
 ### 5. Test
 
 ```bash
-curl http://127.0.0.1:8787/healthz
+curl http://127.0.0.1:1994/healthz
 
-curl http://127.0.0.1:8787/v1/models \
+curl http://127.0.0.1:1994/v1/models \
   -H "Authorization: Bearer sk-notionchat"
 
-curl http://127.0.0.1:8787/v1/chat/completions \
+curl http://127.0.0.1:1994/v1/chat/completions \
   -H "Authorization: Bearer sk-notionchat" \
   -H "Content-Type: application/json" \
   -d "{\"model\":\"opus-4.8\",\"messages\":[{\"role\":\"user\",\"content\":\"Say hello in one sentence.\"}]}"
@@ -127,7 +127,7 @@ Import [`postman/NotionChat.postman_collection.json`](postman/NotionChat.postman
 
 1. Run NotionChat locally (`python -m notionchat serve`).
 2. In your router or Cursor custom model settings:
-   - **Base URL:** `http://127.0.0.1:8787/v1`
+   - **Base URL:** `http://127.0.0.1:1994/v1`
    - **API key:** value of `NOTIONCHAT_API_KEY` from `.env`
    - **Model:** e.g. `opus-4.8` (see `/v1/models`)
 
