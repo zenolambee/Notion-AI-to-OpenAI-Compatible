@@ -90,6 +90,67 @@ _META_REASONING_MARKERS = (
 
 _HEADING_START_RE = re.compile(r"#{1,6}\s+\S")
 
+# Notion sometimes leaks internal XML-ish annotations into chat text.
+_NOTION_XML_TAG_RE = re.compile(
+    r"</?(?:lang|page|mention|equation|code|callout|toggle|column|synced_block)"
+    r"(?:\s[^>]*)?>",
+    re.IGNORECASE,
+)
+# Incomplete tag at EOL: <lang primary=" Title text  → keep "Title text"
+_NOTION_XML_INCOMPLETE_RE = re.compile(
+    r"<(?:lang|page)\s+(?:primary|lang)=[\"']?\s*([^\"'<>\n]*)[\"']?\s*$",
+    re.IGNORECASE | re.MULTILINE,
+)
+# Mid-word hash spam from broken stream deltas / markdown corruption:
+# e.g. "B####a##o####erform####anyak"
+_HASH_GARBLE_RE = re.compile(r"(?:\w#+\w|#+\w|\w#+)")
+
+
+def _strip_notion_xml_leaks(text: str) -> str:
+    if not text:
+        return text
+    # Prefer salvaging title/body text from incomplete <lang primary="... tags
+    text = _NOTION_XML_INCOMPLETE_RE.sub(lambda m: (m.group(1) or "").strip(), text)
+    text = _NOTION_XML_TAG_RE.sub("", text)
+    return text
+
+
+def _looks_hash_garbled(text: str) -> bool:
+    """Detect text where # is densely interleaved with letters (broken stream)."""
+    if not text or "#" not in text:
+        return False
+    sample = text[:4000]
+    letters = sum(1 for c in sample if c.isalpha())
+    hashes = sample.count("#")
+    if letters < 40 or hashes < 20:
+        return False
+    # Normal markdown headings rarely exceed ~1 hash per 25 letters in a sample.
+    return hashes / max(letters, 1) > 0.15 and bool(_HASH_GARBLE_RE.search(sample))
+
+
+def _degarbble_hash_spam(text: str) -> str:
+    """Best-effort recovery when # is interleaved into words.
+
+    Keeps real markdown headings (line-leading # + space) and fenced code,
+    but strips mid-word hash runs like "per##form##a".
+    """
+    if not text or not _looks_hash_garbled(text):
+        return text
+
+    lines: list[str] = []
+    for line in text.split("\n"):
+        heading = re.match(r"^(#{1,6})\s+(.*)$", line)
+        if heading:
+            body = re.sub(r"(?<=\w)#+(?=\w)", "", heading.group(2))
+            body = re.sub(r"#{3,}", "", body)
+            lines.append(f"{heading.group(1)} {body}".rstrip())
+            continue
+        cleaned = re.sub(r"(?<=\w)#+(?=\w)", "", line)
+        cleaned = re.sub(r"(?<!\n)#{3,}(?!\s)", "", cleaned)
+        lines.append(cleaned)
+    return "\n".join(lines)
+
+
 @dataclass(slots=True)
 class NDJSONParseResult:
     text: str = ""
@@ -182,14 +243,18 @@ def _strip_meta_reasoning(text: str) -> str:
 
 
 
-def clean_notion_output_text(text: str) -> str:
-    """Remove Notion web-search, Notion-page, and meta-reasoning lead-ins that leak into assistant text."""
+def clean_notion_output_text(text: str, *, finalize: bool = True) -> str:
+    """Remove Notion web-search, Notion-page, and meta-reasoning lead-ins that leak into assistant text.
+
+    finalize=False is stream-safe: strip leaks/preambles but do NOT rewrite interior
+    whitespace (that would desync already-emitted SSE deltas).
+    """
     if not text:
         return text
 
-    stripped = text.strip()
+    stripped = _strip_notion_xml_leaks(text).strip()
     if not stripped:
-        return text
+        return text if not text.strip() else ""
 
     # If the model is leaking internal reasoning as text, suppress everything
     # until we can find the real start of the answer. While streaming, this
@@ -205,7 +270,7 @@ def clean_notion_output_text(text: str) -> str:
     if heading and heading.start() > 0:
         before = stripped[: heading.start()].strip().rstrip(".")
         if _looks_like_search_preamble(before) or _looks_like_notion_page_preamble(before):
-            return stripped[heading.start() :].lstrip()
+            stripped = stripped[heading.start() :].lstrip()
 
     if "\n" in stripped:
         first_line, rest = stripped.split("\n", 1)
@@ -213,14 +278,18 @@ def clean_notion_output_text(text: str) -> str:
             (_looks_like_search_preamble(first_line) or _looks_like_notion_page_preamble(first_line))
             and rest.strip()
         ):
-            return rest.strip()
+            stripped = rest.strip()
 
     if (
         _looks_like_search_preamble(stripped) or _looks_like_notion_page_preamble(stripped)
     ) and not _HEADING_START_RE.search(stripped):
         return ""
 
-    return _repair_missing_whitespace(stripped)
+    stripped = _degarbble_hash_spam(stripped)
+
+    if finalize:
+        return _repair_missing_whitespace(stripped)
+    return stripped
 
 
 _MISSING_SPACE_RE = re.compile(r"([a-z0-9\)\"'])([.!?])([A-Z])")

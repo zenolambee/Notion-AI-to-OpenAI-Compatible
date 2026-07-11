@@ -200,37 +200,46 @@ class NotionAIClient:
         *,
         on_delta: Callable[[str], None] | None = None,
     ) -> None:
-        last_emitted_clean = ""
+        # Append-only raw streaming. Re-cleaning the full buffer every chunk
+        # desyncs deltas and injects fragments mid-word (e.g. "Pern" spam).
+        last_raw = ""
         has_released_buffer = False
         try:
             async for line in resp.aiter_lines():
                 if isinstance(line, bytes):
                     line = line.decode("utf-8", errors="replace")
                 parser.feed_line(line)
-                if on_delta:
-                    if not has_released_buffer:
-                        text = parser.text
-                        should_release = (
-                            len(text) >= 500
-                            or "\n\n" in text
-                            or "\n#" in text
-                            or text.startswith("#")
-                        )
-                        if not should_release:
-                            continue
-                        has_released_buffer = True
+                if not on_delta:
+                    continue
 
-                    cleaned = clean_notion_output_text(parser.text)
-                    if cleaned and len(cleaned) > len(last_emitted_clean):
-                        delta = cleaned[len(last_emitted_clean) :]
+                raw = parser.text
+                if not has_released_buffer:
+                    should_release = (
+                        len(raw) >= 500
+                        or "\n\n" in raw
+                        or "\n#" in raw
+                        or raw.startswith("#")
+                    )
+                    if not should_release:
+                        continue
+                    has_released_buffer = True
+                    cleaned = clean_notion_output_text(raw, finalize=True)
+                    if cleaned:
+                        on_delta(cleaned)
+                    last_raw = raw
+                    continue
+
+                if raw.startswith(last_raw):
+                    delta = raw[len(last_raw) :]
+                    if delta:
                         on_delta(delta)
-                        last_emitted_clean = cleaned
+                        last_raw = raw
+                # else: Notion rewrote earlier blocks — wait until text extends again
 
             if on_delta and not has_released_buffer and parser.text:
-                cleaned = clean_notion_output_text(parser.text)
-                if cleaned and len(cleaned) > len(last_emitted_clean):
-                    delta = cleaned[len(last_emitted_clean) :]
-                    on_delta(delta)
+                cleaned = clean_notion_output_text(parser.text, finalize=True)
+                if cleaned:
+                    on_delta(cleaned)
         finally:
             await _safe_close_response(resp)
 
@@ -247,7 +256,7 @@ class NotionAIClient:
         """
         client = self._get_client()
         url = f"{self.base_url}/runInferenceTranscript"
-        last_emitted_clean = clean_notion_output_text(parser.text)
+        last_raw = parser.text
         for _ in range(MAX_AUTO_CONFIRM_ROUNDS):
             pending = parser.pop_pending_confirmations()
             if not pending:
@@ -277,11 +286,12 @@ class NotionAIClient:
                         line = line.decode("utf-8", errors="replace")
                     parser.feed_line(line)
                     if on_delta:
-                        cleaned = clean_notion_output_text(parser.text)
-                        if cleaned and len(cleaned) > len(last_emitted_clean):
-                            delta = cleaned[len(last_emitted_clean) :]
-                            on_delta(delta)
-                            last_emitted_clean = cleaned
+                        raw = parser.text
+                        if raw.startswith(last_raw):
+                            delta = raw[len(last_raw) :]
+                            if delta:
+                                on_delta(delta)
+                                last_raw = raw
             except Exception:
                 log.exception("Auto-confirm request errored; leaving response as-is")
                 return
@@ -396,12 +406,12 @@ class NotionAIClient:
         url = f"{self.base_url}/runInferenceTranscript"
         client = self._get_client()
         parser = NDJSONStreamParser()
-        last_emitted_clean = ""
+        last_raw = ""
         queue: asyncio.Queue[str | None] = asyncio.Queue()
         http_error: list[BaseException] = []
 
         async def producer() -> None:
-            nonlocal last_emitted_clean
+            nonlocal last_raw
             has_released_buffer = False
             resp = None
             try:
@@ -413,35 +423,37 @@ class NotionAIClient:
                         line = line.decode("utf-8", errors="replace")
                     parser.feed_line(line)
 
+                    raw = parser.text
                     if not has_released_buffer:
-                        text = parser.text
                         should_release = (
-                            len(text) >= 500
-                            or "\n\n" in text
-                            or "\n#" in text
-                            or text.startswith("#")
+                            len(raw) >= 500
+                            or "\n\n" in raw
+                            or "\n#" in raw
+                            or raw.startswith("#")
                         )
                         if not should_release:
                             continue
                         has_released_buffer = True
+                        cleaned = clean_notion_output_text(raw, finalize=True)
+                        if cleaned:
+                            await queue.put(cleaned)
+                        last_raw = raw
+                        continue
 
-                    cleaned = clean_notion_output_text(parser.text)
-                    if cleaned and len(cleaned) > len(last_emitted_clean):
-                        delta = cleaned[len(last_emitted_clean) :]
-                        await queue.put(delta)
-                        last_emitted_clean = cleaned
+                    if raw.startswith(last_raw):
+                        delta = raw[len(last_raw) :]
+                        if delta:
+                            await queue.put(delta)
+                            last_raw = raw
 
                 if not has_released_buffer and parser.text:
-                    cleaned = clean_notion_output_text(parser.text)
-                    if cleaned and len(cleaned) > len(last_emitted_clean):
-                        delta = cleaned[len(last_emitted_clean) :]
-                        await queue.put(delta)
-                        last_emitted_clean = cleaned
+                    cleaned = clean_notion_output_text(parser.text, finalize=True)
+                    if cleaned:
+                        await queue.put(cleaned)
 
                 if parser.pending_tool_confirmations:
 
                     def _emit(delta: str) -> None:
-                        nonlocal last_emitted_clean
                         # queue.put is a coroutine; schedule it without blocking the
                         # sync callback interface shared with the non-streaming path.
                         asyncio.get_event_loop().create_task(queue.put(delta))
