@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import time
@@ -300,6 +301,7 @@ async def _stream_openai(
     tools: list[dict[str, Any]],
     tools_active: bool,
     ide_agent: bool,
+    content_mode: bool = False,
 ) -> AsyncIterator[str]:
     completion_id = f"chatcmpl-{uuid.uuid4().hex[:24]}"
     created = int(time.time())
@@ -313,6 +315,7 @@ async def _stream_openai(
             tools_active=tools_active,
             ide_agent_mode=ide_agent,
             client_tools=tools,
+            buffer_until_complete=False,
         )
 
         if tools_active:
@@ -423,7 +426,11 @@ async def _stream_openai(
                     finish_reason="stop",
                 )
         else:
+            # Live-stream deltas. Notion may rewrite earlier blocks; client.py emits
+            # <<<MUGHU_STREAM_REPLACE>>> snapshots for those — keep streaming.
+            live_parts: list[str] = []
             async for piece in deltas:
+                live_parts.append(piece)
                 yield _chunk(
                     completion_id=completion_id,
                     created=created,
@@ -433,6 +440,37 @@ async def _stream_openai(
             result = finalize()
             if not ide_agent and not tools_active:
                 _remember_thread(req, result.thread_id, settings)
+
+            # Final authoritative snapshot if live stream drifted from cleaned result.
+            final_text = (result.text or "").strip()
+            live_joined = "".join(live_parts)
+            replace_mark = "<<<MUGHU_STREAM_REPLACE>>>\n"
+            live_text = (
+                live_joined[live_joined.rfind(replace_mark) + len(replace_mark) :]
+                if replace_mark in live_joined
+                else live_joined
+            ).strip()
+            if final_text and (
+                content_mode
+                and (
+                    len(final_text) > len(live_text) + 40
+                    or (
+                        live_text
+                        and final_text != live_text
+                        and not final_text.startswith(live_text[: min(200, len(live_text))])
+                    )
+                )
+            ):
+                replace_payload = f"{replace_mark}{final_text}"
+                step = 600
+                for pos in range(0, len(replace_payload), step):
+                    yield _chunk(
+                        completion_id=completion_id,
+                        created=created,
+                        model=req.model,
+                        delta={"content": replace_payload[pos : pos + step]},
+                    )
+
             finish_reason = "tool_calls" if result.tool_calls else "stop"
             if result.tool_calls:
                 yield _chunk(
@@ -622,6 +660,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                             tools=tools,
                             tools_active=tools_active,
                             ide_agent=ide_agent,
+                            content_mode=content_mode,
                         ),
                         media_type="text/event-stream",
                     )

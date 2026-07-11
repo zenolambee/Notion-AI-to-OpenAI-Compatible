@@ -395,6 +395,7 @@ class NotionAIClient:
         tools_active: bool = False,
         ide_agent_mode: bool = False,
         client_tools: list[dict[str, Any]] | None = None,
+        buffer_until_complete: bool = False,
     ) -> tuple[AsyncIterator[str], str, Callable[[], ChatResult]]:
         body, headers, active_thread_id, notion_model, save_state = self._prepare(
             prompt=prompt,
@@ -406,12 +407,13 @@ class NotionAIClient:
         url = f"{self.base_url}/runInferenceTranscript"
         client = self._get_client()
         parser = NDJSONStreamParser()
-        last_raw = ""
+        last_emitted = ""
         queue: asyncio.Queue[str | None] = asyncio.Queue()
         http_error: list[BaseException] = []
+        replace_mark = "<<<MUGHU_STREAM_REPLACE>>>\n"
 
         async def producer() -> None:
-            nonlocal last_raw
+            nonlocal last_emitted
             has_released_buffer = False
             resp = None
             try:
@@ -423,46 +425,70 @@ class NotionAIClient:
                         line = line.decode("utf-8", errors="replace")
                     parser.feed_line(line)
 
+                    if buffer_until_complete:
+                        # Collect only — final cleaned text is emitted after finalize
+                        # in the OpenAI SSE layer (avoids mid-article dropouts).
+                        continue
+
                     raw = parser.text
+                    cleaned = clean_notion_output_text(raw, finalize=False)
+                    if not cleaned:
+                        continue
+
                     if not has_released_buffer:
                         should_release = (
-                            len(raw) >= 500
-                            or "\n\n" in raw
-                            or "\n#" in raw
-                            or raw.startswith("#")
+                            len(cleaned) >= 80
+                            or "\n\n" in cleaned
+                            or "\n#" in cleaned
+                            or cleaned.startswith("#")
                         )
                         if not should_release:
                             continue
                         has_released_buffer = True
-                        cleaned = clean_notion_output_text(raw, finalize=True)
-                        if cleaned:
-                            await queue.put(cleaned)
-                        last_raw = raw
+                        await queue.put(cleaned)
+                        last_emitted = cleaned
                         continue
 
-                    if raw.startswith(last_raw):
-                        delta = raw[len(last_raw) :]
+                    if cleaned == last_emitted:
+                        continue
+
+                    if cleaned.startswith(last_emitted):
+                        delta = cleaned[len(last_emitted) :]
                         if delta:
                             await queue.put(delta)
-                            last_raw = raw
+                            last_emitted = cleaned
+                    else:
+                        # Notion patched an earlier block — push a full snapshot
+                        # so OpenAI-style append clients can resync (live streaming).
+                        await queue.put(replace_mark + cleaned)
+                        last_emitted = cleaned
 
-                if not has_released_buffer and parser.text:
-                    cleaned = clean_notion_output_text(parser.text, finalize=True)
-                    if cleaned:
-                        await queue.put(cleaned)
+                if not buffer_until_complete:
+                    if not has_released_buffer and parser.text:
+                        cleaned = clean_notion_output_text(parser.text, finalize=True)
+                        if cleaned:
+                            await queue.put(cleaned)
+                            last_emitted = cleaned
+                    elif has_released_buffer and parser.text:
+                        final_cleaned = clean_notion_output_text(parser.text, finalize=True)
+                        if final_cleaned and final_cleaned != last_emitted:
+                            if final_cleaned.startswith(last_emitted):
+                                await queue.put(final_cleaned[len(last_emitted) :])
+                            else:
+                                await queue.put(replace_mark + final_cleaned)
+                            last_emitted = final_cleaned
 
                 if parser.pending_tool_confirmations:
-
                     def _emit(delta: str) -> None:
-                        # queue.put is a coroutine; schedule it without blocking the
-                        # sync callback interface shared with the non-streaming path.
+                        if buffer_until_complete:
+                            return
                         asyncio.get_event_loop().create_task(queue.put(delta))
 
                     await self._auto_confirm_pending(
                         parser=parser,
                         headers=headers,
                         active_thread_id=active_thread_id,
-                        on_delta=_emit,
+                        on_delta=None if buffer_until_complete else _emit,
                     )
             except BaseException as e:
                 http_error.append(e)

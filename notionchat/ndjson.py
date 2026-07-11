@@ -151,6 +151,24 @@ def _degarbble_hash_spam(text: str) -> str:
     return "\n".join(lines)
 
 
+def _join_text_blocks(parts: list[str]) -> str:
+    """Join Notion text blocks without smashing markdown (esp. code fences).
+
+    Notion streams multiple text blocks; concatenating with '' drops the newline
+    between a closing fence and the next line, so code leaks into prose.
+    """
+    cleaned = [p for p in parts if p]
+    if not cleaned:
+        return ""
+    out = cleaned[0]
+    for part in cleaned[1:]:
+        if out.endswith("\n") or part.startswith("\n"):
+            out += part
+        else:
+            out += "\n" + part
+    return out
+
+
 @dataclass(slots=True)
 class NDJSONParseResult:
     text: str = ""
@@ -346,7 +364,7 @@ class NDJSONStreamParser:
                     path = f"{prefix}/value/{v_idx}"
                     if self._value_types.get(path) == "text":
                         parts.append(self._block_contents.get(path, ""))
-            return "".join(parts)
+            return _join_text_blocks(parts)
         return self._stored_text
 
     @text.setter
