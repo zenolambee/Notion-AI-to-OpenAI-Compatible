@@ -169,19 +169,21 @@ config.example.json
 
 ### What this project already has (Done)
 - [x] **OpenAI-Compatible completions API** (`/v1/chat/completions`) with full SSE streaming and non-streaming support.
-- [x] **Dynamic model resolution** (`/v1/models`) fetching enabled models directly from Notion and mapping aliases (`opus-4.8`, `gpt-4o`, `sonnet-4.6`).
+- [x] **Dynamic model resolution** (`/v1/models`) fetching enabled models directly from Notion and mapping aliases (`opus-4.8`, `gpt-4o`, `sonnet-4.6`, `Grok 4.5`, `GPT-5.6 Terra/Sol/Luna`).
 - [x] **Auto-Bootstrap account init** from raw browser cookie strings directly on start.
+- [x] **Interactive CLI setup wizard** (`python -m notionchat setup`) for cookie + `.env` configuration.
 - [x] **State-aware NDJSON patch parser** which correctly resolves nested block paths to prevent text corruption/merges.
 - [x] **Stream buffering & cleaning** to strip model preambles ("I'm ready to write this...") without slicing into the actual response.
 - [x] **`patch-sync` event parsing** to support models like `opus-4.8` without 502/empty errors.
 - [x] **Chrome TLS Impersonation** (via `curl_cffi`) and Windows event loop fixes for high stability.
+- [x] **Windows Server browser fingerprinting** (`browser_fp`) to reduce `trust-rule-denied` when browser AI works but the API does not.
+- [x] **Auto-confirm web-search URL safety prompts** so long research generations don't stall waiting for a manual Allow click.
 - [x] **Experimental Tools Compiler** for mapping Cursor Agent commands (`Shell`, `Write`) to Notion prose blocks and back.
 
 ### Next Steps (Todo)
 - [ ] **Multi-Cookie/Account rotation pool** to load-balance requests across multiple Notion accounts.
 - [ ] **Auto-refresh cookie session** by simulating background navigation.
 - [ ] **Multimodal support** (images/assets) mapped to Notion's inline image attachment blocks.
-- [ ] **Interactive CLI setup wrapper** to guide users through cookie extraction and auto-configuration.
 - [ ] **Full Custom Agent configuration** via endpoint custom params or headers.
 - [ ] **Dockerization** — add a simple `Dockerfile` and `docker-compose.yml` to spin up the proxy server anywhere.
 - [ ] **Lightweight Dashboard (Web UI)** — add a `/admin` panel to monitor active threads, log history, and verify/refresh browser cookies in real-time.
