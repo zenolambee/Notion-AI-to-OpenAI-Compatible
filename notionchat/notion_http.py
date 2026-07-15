@@ -80,21 +80,38 @@ class NotionStreamResponse:
         if self._closed:
             return
         self._closed = True
+        resp = self._resp
+        # Abort an in-flight body so curl_cffi's perform() can finish.
+        # Sync Response.close() sets quit_now but never awaits astream_task —
+        # that leaves orphaned Tasks ("Task was destroyed but it is pending!").
         with suppress(Exception):
-            self._resp.close()
-        # Drain curl_cffi cleanup callbacks before closing the session.
-        # Without this, Python logs "Task was destroyed but it is pending!".
-        for _ in range(3):
-            await asyncio.sleep(0)
+            quit_now = getattr(resp, "quit_now", None)
+            if quit_now is not None and not quit_now.is_set():
+                quit_now.set()
+        stream_task = getattr(resp, "astream_task", None)
+        if stream_task is not None:
+            with suppress(asyncio.CancelledError, asyncio.TimeoutError, Exception):
+                await asyncio.wait_for(stream_task, timeout=5.0)
+            with suppress(Exception):
+                resp.astream_task = None
+        else:
+            with suppress(Exception):
+                resp.close()
         with suppress(Exception):
             await self._session.close()
+        # Let curl_cffi cleanup callbacks scheduled by release_curl run.
         for _ in range(2):
             await asyncio.sleep(0)
 
     def close(self) -> None:
+        """Sync close — prefer aclose() on the event loop."""
         if self._closed:
             return
         self._closed = True
+        with suppress(Exception):
+            quit_now = getattr(self._resp, "quit_now", None)
+            if quit_now is not None and not quit_now.is_set():
+                quit_now.set()
         with suppress(Exception):
             self._resp.close()
 
@@ -143,8 +160,10 @@ class NotionHttpClient:
             return NotionStreamResponse(resp, session)
         except BaseException:
             with suppress(Exception):
-                await asyncio.sleep(0)
                 await session.close()
+            for _ in range(2):
+                with suppress(Exception):
+                    await asyncio.sleep(0)
             raise
 
     async def post_json(self, url: str, *, json: dict[str, Any], headers: dict[str, str]) -> Any:
