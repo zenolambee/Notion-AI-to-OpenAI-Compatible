@@ -13,6 +13,8 @@ _COOKIE_HELP = """
 How to copy your Notion browser cookie:
 
   1. Log in at https://www.notion.com
+     (On a VPS: log in from a browser that uses the SAME public IP as the server,
+      or set NOTION_PROXY first — home-PC cookies often fail trust checks on datacenter IPs.)
   2. Open DevTools (F12) → Application → Cookies → https://www.notion.com
   3. Select all cookie rows, or run this in the Console tab:
 

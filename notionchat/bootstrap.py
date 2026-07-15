@@ -16,6 +16,7 @@ from notionchat.browser_fp import (
     fingerprint_kwargs,
 )
 from notionchat.exceptions import NotionChatError
+from notionchat.notion_http import resolve_notion_proxy
 
 log = logging.getLogger(__name__)
 
@@ -73,13 +74,16 @@ def _fetch_load_user_content(
         accept="application/json",
         referer="https://app.notion.com/",
     )
-    resp = requests.post(
-        f"{BASE_URL}/loadUserContent",
-        json={"cursor": {"stack": []}, "limit": 100},
-        headers=headers,
-        impersonate=impersonate or fp["impersonate"],
-        timeout=30.0,
-    )
+    post_kwargs: dict[str, Any] = {
+        "json": {"cursor": {"stack": []}, "limit": 100},
+        "headers": headers,
+        "impersonate": impersonate or fp["impersonate"],
+        "timeout": 30.0,
+    }
+    proxy = resolve_notion_proxy()
+    if proxy:
+        post_kwargs["proxy"] = proxy
+    resp = requests.post(f"{BASE_URL}/loadUserContent", **post_kwargs)
     if resp.status_code != 200:
         raise NotionChatError(
             f"loadUserContent failed ({resp.status_code}): {resp.text[:300]!r}",

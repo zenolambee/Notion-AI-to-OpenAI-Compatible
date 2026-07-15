@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 from contextlib import suppress
 from typing import Any
+from urllib.parse import urlsplit
 
 from curl_cffi.requests import AsyncSession, Response
 
@@ -12,6 +14,34 @@ from notionchat.browser_fp import impersonate_for_user_agent
 log = logging.getLogger(__name__)
 
 DEFAULT_TIMEOUT = 300.0
+
+
+def resolve_notion_proxy() -> str | None:
+    """HTTP(S)/SOCKS proxy for Notion egress (local cookie on a VPS needs home IP)."""
+    for key in (
+        "NOTION_PROXY",
+        "HTTPS_PROXY",
+        "https_proxy",
+        "HTTP_PROXY",
+        "http_proxy",
+        "ALL_PROXY",
+        "all_proxy",
+    ):
+        value = os.getenv(key, "").strip()
+        if value:
+            return value
+    return None
+
+
+def _proxy_log_label(proxy: str) -> str:
+    """Redact credentials for logs."""
+    try:
+        parts = urlsplit(proxy)
+        host = parts.hostname or "?"
+        port = f":{parts.port}" if parts.port else ""
+        return f"{parts.scheme or 'proxy'}://{host}{port}"
+    except Exception:
+        return "(proxy)"
 
 
 # --- curl_cffi 0.15.0 + Python 3.14 workaround ---------------------------------
@@ -124,9 +154,18 @@ class NotionHttpClient:
     closed after the response is consumed.
     """
 
-    def __init__(self, *, timeout: float = DEFAULT_TIMEOUT, impersonate: str | None = None) -> None:
+    def __init__(
+        self,
+        *,
+        timeout: float = DEFAULT_TIMEOUT,
+        impersonate: str | None = None,
+        proxy: str | None = None,
+    ) -> None:
         self._timeout = timeout
         self._impersonate = impersonate
+        self._proxy = proxy if proxy is not None else resolve_notion_proxy()
+        if self._proxy:
+            log.info("Notion HTTP egress via proxy %s", _proxy_log_label(self._proxy))
 
     async def aclose(self) -> None:
         return
@@ -145,7 +184,10 @@ class NotionHttpClient:
         headers: dict[str, str],
         stream: bool,
     ) -> NotionStreamResponse:
-        session = AsyncSession(timeout=self._timeout)
+        session_kwargs: dict[str, Any] = {"timeout": self._timeout}
+        if self._proxy:
+            session_kwargs["proxy"] = self._proxy
+        session = AsyncSession(**session_kwargs)
         impersonate = self._resolve_impersonate(headers)
         log.debug("Notion HTTP impersonate=%s ua=%s", impersonate, headers.get("user-agent", "")[:60])
         try:

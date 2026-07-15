@@ -85,8 +85,18 @@ Edit `.env`:
 | `NOTIONCHAT_DEFAULT_MODEL` | Default Notion model ID |
 | `NOTIONCHAT_HOME` | Optional — absolute project folder so `notion serve` finds `.env` / account files from any cwd |
 | `NOTION_COOKIE` | Optional — full `document.cookie` for auto-bootstrap on startup |
+| `NOTION_PROXY` | Optional — HTTP/SOCKS proxy for Notion egress (needed when a home-PC cookie is used on a VPS) |
+| `NOTION_USER_AGENT` / `NOTION_CLIENT_VERSION` | Optional — match the browser that created the cookie |
 
 ### 3. Bootstrap account from browser cookie
+
+**Important (VPS / production):** Notion ties AI permission to the **IP where you logged in**. Copying a cookie from your home PC browser onto a VPS often causes intermittent `403` / `trust-rule-denied` ("This action is not currently available"). Prefer one of:
+
+1. Log into Notion **on the VPS** (or any browser exiting the same public IP), use Notion AI once, then copy **that** cookie and run `init`.
+2. Or set `NOTION_PROXY` to a SOCKS/HTTP proxy that exits your home/residential IP, then init + serve through that proxy.
+3. Or run NotionChat on the same machine/network as the browser.
+
+Then:
 
 1. Log in to [Notion](https://www.notion.com) in your browser.
 2. Open DevTools → **Application** → **Cookies** → `https://www.notion.com`.
@@ -399,7 +409,7 @@ Contributions welcome on [`notionchat/tools.py`](notionchat/tools.py) — especi
 |---------|----------------|
 | Empty assistant response | Refresh cookie; check `space_id` in account file; verify AI credits |
 | `402 Payment Required` | Notion AI credits exhausted for this workspace — check Notion billing / quota or switch cookie |
-| `401` / `403` from Notion | Re-run `notion init --cookie "..."` (fresh full cookie from the same machine) |
+| `401` / `403` from Notion | Cookie/IP trust mismatch is common: re-init with a cookie taken **on the same public IP** as the server, or set `NOTION_PROXY` to exit via your home IP |
 | `notion` not found in CMD | Add `.venv\Scripts` or `scripts\` to PATH; set `NOTIONCHAT_HOME` to the project folder |
 | Agent does nothing | New Agent chat; check server logs for `IDE bridge tool_calls=...` |
 | Wrong model | Call `GET /v1/models`; use an ID from that list |
