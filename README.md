@@ -1,15 +1,48 @@
-# Notion AI to OpenAI Compatible
+<div align="center">
 
-OpenAI-compatible HTTP API that routes chat requests to **Notion AI** (`runInferenceTranscript`) using your Notion browser session.
+# Notion AI → OpenAI Compatible
 
-Use it with [Cursor](https://cursor.com), [9router](https://github.com), Postman, or any client that speaks the OpenAI Chat Completions API.
+**Unofficial OpenAI-compatible proxy for Notion AI**  
+Cookie auth · streaming · Cursor / 9router / Postman
 
-[![PayPal](https://img.shields.io/badge/PayPal-Donate-blue?style=flat-square&logo=paypal)](https://paypal.me/captainredz?locale.x=en_US&country.x=ID)
-[![Traktir Kopi](https://img.shields.io/badge/%F0%9F%8D%B5%20Traktir%20Kopi-MuGhu-orange?style=flat-square)](https://traktir.mughu.id/)
+[![License: MIT](https://img.shields.io/badge/License-MIT-22c55e?style=for-the-badge)](LICENSE)
+[![Python](https://img.shields.io/badge/Python-3.11+-3776AB?style=for-the-badge&logo=python&logoColor=white)](https://www.python.org/)
+[![FastAPI](https://img.shields.io/badge/FastAPI-OpenAI%20API-009688?style=for-the-badge&logo=fastapi&logoColor=white)](https://fastapi.tiangolo.com/)
 
-> **Educational Purpose Only** — This project is intended for learning and research purposes only. It is not affiliated with, endorsed by, or officially supported by Notion. Do not use it to violate Notion's Terms of Service or to access paid features without a valid subscription.
+<br/>
 
-> **Unofficial project.** Not affiliated with or endorsed by Notion. You are responsible for complying with Notion's terms of service and your workspace plan limits.
+### Support the project
+
+If this saves you time, a coffee (or satoshi) helps keep it maintained.
+
+[![PayPal](https://img.shields.io/badge/PayPal-Donate-00457C?style=for-the-badge&logo=paypal&logoColor=white)](https://paypal.me/captainredz?locale.x=en_US&country.x=ID)
+[![Traktir Kopi](https://img.shields.io/badge/Traktir%20Kopi-MuGhu-F59E0B?style=for-the-badge)](https://traktir.mughu.id/)
+
+| | Network | Address |
+|:--:|:--|:--|
+| **BTC** | Bitcoin | `bc1pq0njd8sqextzrx2xx2qlzuud2m3nkcxqqu2kpyk6gwnufsum2phq6fdvtw` |
+| **SOL** | Solana | `HUW8ntbpNGRcdTWc32yat3UCKcsHuiz1Me2QurPcF6iC` |
+| **USDT** | Solana | `HUW8ntbpNGRcdTWc32yat3UCKcsHuiz1Me2QurPcF6iC` |
+| **USDT** | TRON (TRC20) | `TY5qoR528nTwgkRvQmDMoRpmDRjKXnHMse` |
+
+<p>
+  <img src="https://img.shields.io/badge/BTC-Bitcoin-F7931A?style=flat-square&logo=bitcoin&logoColor=white" alt="BTC"/>
+  <img src="https://img.shields.io/badge/SOL-Solana-9945FF?style=flat-square&logo=solana&logoColor=white" alt="SOL"/>
+  <img src="https://img.shields.io/badge/USDT-Solana-26A17B?style=flat-square&logo=tether&logoColor=white" alt="USDT Solana"/>
+  <img src="https://img.shields.io/badge/USDT-TRON%20TRC20-EF0027?style=flat-square&logo=tron&logoColor=white" alt="USDT TRON"/>
+</p>
+
+<sub>Send only the matching network asset to each address — wrong-chain transfers are lost forever.</sub>
+
+</div>
+
+---
+
+> **Educational / unofficial** — for learning and research. Not affiliated with or endorsed by Notion. You must comply with Notion’s Terms of Service and your workspace plan limits.
+
+OpenAI-compatible HTTP API that routes chat to **Notion AI** (`runInferenceTranscript`) using your Notion browser session (`token_v2`).
+
+Works with [Cursor](https://cursor.com), [9router](https://github.com), Postman, or any OpenAI Chat Completions client.
 
 ## Features
 
@@ -437,10 +470,3 @@ This software is provided as-is. Using browser session cookies to access Notion'
 ## License
 
 [MIT](LICENSE)
-
-## Support
-
-If you find this project useful, consider supporting its development:
-
-[![PayPal](https://img.shields.io/badge/PayPal-Donate-blue?style=flat-square&logo=paypal)](https://paypal.me/captainredz?locale.x=en_US&country.x=ID)
-[![Traktir Kopi](https://img.shields.io/badge/%F0%9F%8D%B5%20Traktir%20Kopi-MuGhu-orange?style=flat-square)](https://traktir.mughu.id/)
