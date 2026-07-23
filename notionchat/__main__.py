@@ -37,6 +37,45 @@ def cmd_serve(_: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_sync_models(args: argparse.Namespace) -> int:
+    """Populate models.json by scraping arena.ai in a headless browser."""
+    import logging
+
+    logging.basicConfig(
+        level=os.getenv("ARENACHAT_LOG_LEVEL", "INFO").upper(),
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+    )
+
+    from notionchat.config import load_account_from_env, load_settings
+    from notionchat.models_sync import sync_models
+
+    settings = load_settings()
+    try:
+        account = load_account_from_env(settings)
+    except Exception as e:
+        print(f"Failed to load Arena account: {e}", file=sys.stderr)
+        print(
+            "Set ARENA_COOKIE in .env (from arena.ai DevTools) first.",
+            file=sys.stderr,
+        )
+        return 1
+
+    dest = Path(args.output) if args.output else None
+    try:
+        written = asyncio.run(
+            sync_models(
+                account,
+                output_path=dest,
+                dwell_seconds=float(args.dwell),
+            )
+        )
+    except Exception as e:
+        print(f"sync-models failed: {e}", file=sys.stderr)
+        return 1
+    print(f"OK — wrote arena models to {written}")
+    return 0
+
+
 def _install_playwright_browsers() -> int:
     """Run `playwright install chromium` in the current interpreter."""
     import subprocess
@@ -101,6 +140,23 @@ def main(argv: list[str] | None = None) -> None:
         help="Download the headless Chromium used for auto reCAPTCHA minting",
     )
     inst_p.set_defaults(func=lambda _: _install_playwright_browsers())
+
+    # sync-models command
+    sync_p = sub.add_parser(
+        "sync-models",
+        help="Scrape arena.ai's model catalog into models.json (needs cookie + Playwright)",
+    )
+    sync_p.add_argument(
+        "--output",
+        default=None,
+        help="Output path (default: $ARENACHAT_MODELS_FILE or ./models.json)",
+    )
+    sync_p.add_argument(
+        "--dwell",
+        default="8",
+        help="Seconds to wait on each probe URL for XHRs to settle (default: 8)",
+    )
+    sync_p.set_defaults(func=cmd_sync_models)
 
     # setup command
     setup_p = sub.add_parser("setup", help="Interactive wizard: cookie -> account file -> .env")
