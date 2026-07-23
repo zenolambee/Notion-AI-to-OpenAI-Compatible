@@ -1,3 +1,7 @@
+"""
+Interactive setup wizard for ArenaChat.
+"""
+
 from __future__ import annotations
 
 import asyncio
@@ -5,22 +9,31 @@ import secrets
 import sys
 from pathlib import Path
 
-from notionchat.account import parse_browser_cookie
-from notionchat.bootstrap import Workspace, bootstrap_from_cookie, list_workspaces_from_cookie_sync
+from notionchat.account import (
+    ArenaAccount,
+    create_account_from_cookie,
+    parse_browser_cookie,
+    save_arena_account,
+    validate_arena_cookie,
+)
 from notionchat.exceptions import NotionChatError
 
 _COOKIE_HELP = """
-How to copy your Notion browser cookie:
+How to copy your Arena.ai browser cookie:
 
-  1. Log in at https://www.notion.com
+  1. Log in at https://arena.ai
      (On a VPS: log in from a browser that uses the SAME public IP as the server,
-      or set NOTION_PROXY first — home-PC cookies often fail trust checks on datacenter IPs.)
-  2. Open DevTools (F12) → Application → Cookies → https://www.notion.com
+      or set ARENACHAT_PROXY first — cookies may fail trust checks on datacenter IPs.)
+
+  2. Open DevTools (F12) → Application → Cookies → https://arena.ai
+
   3. Select all cookie rows, or run this in the Console tab:
 
        copy(document.cookie)
 
-  4. Paste the full string here (must include token_v2).
+  4. Paste the full string here (must include 'arena-auth-prod-v1').
+
+  Note: You may also need the 'cf_clearance' cookie if Cloudflare protection is active.
 """.strip()
 
 
@@ -52,81 +65,34 @@ def _prompt_yes_no(label: str, *, default: bool = True) -> bool:
         _print("  Please answer y or n.")
 
 
-def _validate_cookie(cookie: str) -> str | None:
-    cookie = cookie.strip()
-    if not cookie:
-        return "Cookie is empty."
-    parsed = parse_browser_cookie(cookie)
-    if not parsed.get("token_v2"):
-        return "Cookie is missing token_v2. Copy the full document.cookie string from notion.com."
-    return None
-
-
 def _read_cookie(*, preset: str | None = None) -> str:
+    """Read and validate arena cookie from user input."""
     if preset:
-        error = _validate_cookie(preset)
-        if error:
+        is_valid, error = validate_arena_cookie(preset)
+        if not is_valid:
             raise NotionChatError(error, status_code=400)
         return preset.strip()
 
     _print(_COOKIE_HELP)
     _print()
     while True:
-        _print("Paste your Notion cookie (single line), then press Enter:")
+        _print("Paste your Arena cookie (single line), then press Enter:")
         cookie = input("> ").strip()
-        error = _validate_cookie(cookie)
-        if error is None:
+        is_valid, error = validate_arena_cookie(cookie)
+        if is_valid:
             return cookie
         _print(f"  {error}")
         if not _prompt_yes_no("Try again?", default=True):
             raise NotionChatError("Setup cancelled.", status_code=1)
 
 
-def _choose_workspace(
-    workspaces: list[Workspace],
-    *,
-    preset: str | None = None,
-    default_first: bool = False,
-) -> str:
-    if preset:
-        needle = preset.strip().lower()
-        exact = [w for w in workspaces if w.space_name.lower() == needle]
-        if exact:
-            return exact[0].space_name
-        partial = [
-            w
-            for w in workspaces
-            if needle in w.space_name.lower() or w.space_name.lower() in needle
-        ]
-        if len(partial) == 1:
-            _print(f"Workspace {preset!r} not exact — using {partial[0].space_name!r}")
-            return partial[0].space_name
-        _print(f"Workspace {preset!r} not found — auto-selecting {workspaces[0].space_name!r}")
-        _print(f"  Available: {', '.join(w.space_name for w in workspaces)}")
-        return workspaces[0].space_name
-    if len(workspaces) == 1 or default_first:
-        return workspaces[0].space_name
-
-    _print()
-    _print("Multiple workspaces found — choose one:")
-    for index, workspace in enumerate(workspaces, start=1):
-        domain = f" ({workspace.domain})" if workspace.domain else ""
-        _print(f"  {index}. {workspace.space_name}{domain}")
-
-    while True:
-        choice = input(f"Workspace [1-{len(workspaces)}]: ").strip()
-        if choice.isdigit():
-            picked = int(choice)
-            if 1 <= picked <= len(workspaces):
-                return workspaces[picked - 1].space_name
-        _print("  Enter a number from the list.")
-
-
 def _generate_api_key() -> str:
-    return f"sk-notionchat-{secrets.token_urlsafe(18)}"
+    """Generate a random API key."""
+    return f"sk-arena-chat-{secrets.token_urlsafe(18)}"
 
 
 def _parse_env_file(path: Path) -> dict[str, str]:
+    """Parse an existing .env file."""
     if not path.exists():
         return {}
     values: dict[str, str] = {}
@@ -140,30 +106,25 @@ def _parse_env_file(path: Path) -> dict[str, str]:
 
 
 def _render_env(values: dict[str, str]) -> str:
+    """Render .env file content."""
     lines = [
         "# Generated by: python -m notionchat setup",
-        f"NOTIONCHAT_API_KEY={values['NOTIONCHAT_API_KEY']}",
-        f"NOTIONCHAT_HOST={values.get('NOTIONCHAT_HOST', '127.0.0.1')}",
-        f"NOTIONCHAT_PORT={values.get('NOTIONCHAT_PORT', '8787')}",
-        f"NOTIONCHAT_ACCOUNT={values.get('NOTIONCHAT_ACCOUNT', 'notion_account.json')}",
-        f"NOTIONCHAT_THREADS_DIR={values.get('NOTIONCHAT_THREADS_DIR', 'threads')}",
-        (
-            "NOTIONCHAT_NOTION_BASE_URL="
-            f"{values.get('NOTIONCHAT_NOTION_BASE_URL', 'https://app.notion.com/api/v3')}"
-        ),
-        f"NOTIONCHAT_DEFAULT_MODEL={values.get('NOTIONCHAT_DEFAULT_MODEL', 'ambrosia-tart-high')}",
+        f"ARENACHAT_API_KEY={values.get('ARENACHAT_API_KEY', '')}",
+        f"ARENACHAT_HOST={values.get('ARENACHAT_HOST', '127.0.0.1')}",
+        f"ARENACHAT_PORT={values.get('ARENACHAT_PORT', '1995')}",
+        f"ARENACHAT_ACCOUNT={values.get('ARENACHAT_ACCOUNT', 'arena_account.json')}",
+        f"ARENACHAT_BASE_URL={values.get('ARENACHAT_BASE_URL', 'https://arena.ai/api')}",
+        f"ARENACHAT_DEFAULT_MODEL={values.get('ARENACHAT_DEFAULT_MODEL', 'arena-gpt-4o')}",
     ]
-    space_name = values.get("NOTION_SPACE_NAME", "").strip()
-    if space_name:
-        lines.append(f"NOTION_SPACE_NAME={space_name}")
-    cookie = values.get("NOTION_COOKIE", "").strip()
+    cookie = values.get("ARENA_COOKIE", "").strip()
     if cookie:
-        lines.append(f"NOTION_COOKIE={cookie}")
+        lines.append(f"ARENA_COOKIE={cookie}")
     lines.append("")
     return "\n".join(lines)
 
 
 def _write_env(path: Path, updates: dict[str, str], *, overwrite: bool) -> None:
+    """Write updates to .env file."""
     merged = _parse_env_file(path) if path.exists() and not overwrite else {}
     merged.update(updates)
     path.write_text(_render_env(merged), encoding="utf-8")
@@ -178,8 +139,9 @@ def _print_success(
     port: str,
     api_key: str,
 ) -> None:
+    """Print success message."""
     _print()
-    _print("Setup complete.")
+    _print("Setup complete!")
     _print(f"  Account file : {account_path}")
     if env_written:
         _print(f"  Environment  : {env_path}")
@@ -203,7 +165,6 @@ async def run_interactive_setup(
     env_path: Path | None = None,
     account_path: Path | None = None,
     cookie: str | None = None,
-    space_name: str | None = None,
     api_key: str | None = None,
     host: str | None = None,
     port: str | None = None,
@@ -211,16 +172,17 @@ async def run_interactive_setup(
     force: bool = False,
     yes: bool = False,
 ) -> int:
+    """Run the interactive setup wizard."""
     env_path = (env_path or Path(".env")).expanduser()
-    account_path = (account_path or Path("notion_account.json")).expanduser()
+    account_path = (account_path or Path("arena_account.json")).expanduser()
     write_env = True
 
-    _print("NotionChat setup")
-    _print("================")
+    _print("ArenaChat setup")
+    _print("===============")
     _print()
     _print("This wizard will:")
-    _print("  • validate your Notion browser cookie")
-    _print("  • save notion_account.json")
+    _print("  • validate your Arena.ai browser cookie")
+    _print("  • save arena_account.json")
     _print("  • create or update .env for the local API server")
     _print()
 
@@ -228,37 +190,26 @@ async def run_interactive_setup(
         if not _prompt_yes_no(f"{env_path} already exists. Update it?", default=False):
             write_env = False
 
+    # Read cookie
     cookie_value = _read_cookie(preset=cookie)
 
+    # Create account from cookie
     _print()
-    _print("Contacting Notion to list workspaces...")
+    _print("Validating cookie...")
     try:
-        workspaces = await asyncio.to_thread(list_workspaces_from_cookie_sync, cookie_value)
+        account = create_account_from_cookie(cookie_value)
+        save_arena_account(account, str(account_path))
+        _print(f"  User: {account.user_name or account.user_email or account.user_id}")
+        _print(f"  Cookie domain: {account.cookie_domain}")
     except NotionChatError as exc:
         _print(f"Error: {exc}", file=sys.stderr)
         return 1
 
-    chosen_space = _choose_workspace(workspaces, preset=space_name, default_first=yes)
-
-    _print()
-    _print("Bootstrapping account...")
-    try:
-        account = await bootstrap_from_cookie(
-            cookie_value,
-            space_name=chosen_space,
-            account_path=str(account_path),
-        )
-    except NotionChatError as exc:
-        _print(f"Error: {exc}", file=sys.stderr)
-        return 1
-
-    _print(f"  Workspace: {account.space_name!r}")
-    _print(f"  User     : {account.user_name or account.user_email or account.user_id}")
-
+    # Server settings
     existing_env = _parse_env_file(env_path) if env_path.exists() else {}
-    default_api_key = api_key or existing_env.get("NOTIONCHAT_API_KEY") or _generate_api_key()
-    default_host = host or existing_env.get("NOTIONCHAT_HOST") or "127.0.0.1"
-    default_port = port or existing_env.get("NOTIONCHAT_PORT") or "8787"
+    default_api_key = api_key or existing_env.get("ARENACHAT_API_KEY") or _generate_api_key()
+    default_host = host or existing_env.get("ARENACHAT_HOST") or "127.0.0.1"
+    default_port = port or existing_env.get("ARENACHAT_PORT") or "1995"
 
     if yes:
         resolved_api_key = default_api_key
@@ -273,22 +224,22 @@ async def run_interactive_setup(
         resolved_port = _prompt("Port", default=default_port)
         if write_cookie_to_env is None:
             include_cookie = _prompt_yes_no(
-                "Store NOTION_COOKIE in .env for auto-refresh on startup?",
+                "Store ARENA_COOKIE in .env for auto-refresh on startup?",
                 default=True,
             )
         else:
             include_cookie = write_cookie_to_env
 
+    # Write .env
     if write_env:
-        env_updates = {
-            "NOTIONCHAT_API_KEY": resolved_api_key,
-            "NOTIONCHAT_HOST": resolved_host,
-            "NOTIONCHAT_PORT": resolved_port,
-            "NOTIONCHAT_ACCOUNT": account_path.name,
-            "NOTION_SPACE_NAME": account.space_name,
+        env_updates: dict[str, str] = {
+            "ARENACHAT_API_KEY": resolved_api_key,
+            "ARENACHAT_HOST": resolved_host,
+            "ARENACHAT_PORT": resolved_port,
+            "ARENACHAT_ACCOUNT": account_path.name,
         }
         if include_cookie:
-            env_updates["NOTION_COOKIE"] = cookie_value
+            env_updates["ARENA_COOKIE"] = cookie_value
         overwrite = force or yes or not env_path.exists()
         _write_env(env_path, env_updates, overwrite=overwrite)
         _print(f"  Wrote {env_path}")

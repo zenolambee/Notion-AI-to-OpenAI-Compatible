@@ -1,3 +1,7 @@
+"""
+OpenAI-compatible API for Arena.ai (Chatbot Arena).
+"""
+
 from __future__ import annotations
 
 import asyncio
@@ -12,247 +16,48 @@ from fastapi import Depends, FastAPI, Header, HTTPException
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, ConfigDict
 
-from notionchat.client import ChatResult, NotionAIClient
+from notionchat.arena_client import (
+    ArenaHttpClient,
+    ArenaStreamChunk,
+    get_arena_models,
+)
 from notionchat.config import Settings, load_account_from_env, load_settings
 from notionchat.exceptions import NotionChatError
-from notionchat.models import (
-    cache_openai_models,
-    get_cached_alias_map,
-    get_cached_openai_models,
-    list_openai_models,
-    list_openai_models_from_notion,
-    normalize_request_model,
-    parse_available_models,
-    resolve_model,
-)
-from notionchat.tools import (
-    bridge_ide_agent_response,
-    build_tool_denial_retry_append,
-    client_tool_names,
-    is_ide_agent_messages,
-    looks_like_coding_task_prompt,
-    looks_like_tool_denial,
-    normalize_tools,
-    prepare_chat_input,
-)
 
 log = logging.getLogger(__name__)
 
-_session_threads: dict[str, str] = {}
-_session_models: dict[str, str] = {}
-
-# Shared Notion thread pool (NOTIONCHAT_THREAD_REUSE_LIMIT > 0).
-# Keyed by resolved model so model switches force a fresh window.
-_reuse_pool: dict[str, dict[str, Any]] = {}
-
-
-class FunctionDetails(BaseModel):
-    name: str
-    arguments: str = "{}"
-
-
-class ToolCallPart(BaseModel):
-    id: str
-    type: str = "function"
-    function: FunctionDetails
-
-
-class ToolFunctionSchema(BaseModel):
-    model_config = ConfigDict(extra="ignore")
-
-    name: str
-    description: str | None = None
-    parameters: dict[str, Any] | None = None
-
-
-class ToolDefinition(BaseModel):
-    model_config = ConfigDict(extra="ignore")
-
-    type: str = "function"
-    function: ToolFunctionSchema
+# Default arena models
+DEFAULT_ARENA_MODELS = [
+    {"id": "arena-gpt-4o", "object": "model", "created": 1700000000, "owned_by": "openai", "description": "GPT-4o via Arena.ai"},
+    {"id": "arena-claude-3-5-sonnet", "object": "model", "created": 1700000000, "owned_by": "anthropic", "description": "Claude 3.5 Sonnet via Arena.ai"},
+    {"id": "arena-gemini-1.5-pro", "object": "model", "created": 1700000000, "owned_by": "google", "description": "Gemini 1.5 Pro via Arena.ai"},
+    {"id": "arena-claude-3-opus", "object": "model", "created": 1700000000, "owned_by": "anthropic", "description": "Claude 3 Opus via Arena.ai"},
+    {"id": "arena-gpt-4-turbo", "object": "model", "created": 1700000000, "owned_by": "openai", "description": "GPT-4 Turbo via Arena.ai"},
+    {"id": "arena-gpt-4", "object": "model", "created": 1700000000, "owned_by": "openai", "description": "GPT-4 via Arena.ai"},
+    {"id": "arena-claude-3-sonnet", "object": "model", "created": 1700000000, "owned_by": "anthropic", "description": "Claude 3 Sonnet via Arena.ai"},
+    {"id": "arena-claude-3-haiku", "object": "model", "created": 1700000000, "owned_by": "anthropic", "description": "Claude 3 Haiku via Arena.ai"},
+    {"id": "arena-gemini-1.5-flash", "object": "model", "created": 1700000000, "owned_by": "google", "description": "Gemini 1.5 Flash via Arena.ai"},
+    {"id": "arena-llama-3-70b", "object": "model", "created": 1700000000, "owned_by": "meta", "description": "Llama 3 70B via Arena.ai"},
+    {"id": "arena-llama-3-8b", "object": "model", "created": 1700000000, "owned_by": "meta", "description": "Llama 3 8B via Arena.ai"},
+    {"id": "arena-mixtral-8x7b", "object": "model", "created": 1700000000, "owned_by": "mistral", "description": "Mixtral 8x7B via Arena.ai"},
+]
 
 
 class ChatMessage(BaseModel):
     model_config = ConfigDict(extra="ignore")
-
     role: str
     content: str | list[Any] | None = None
-    tool_calls: list[ToolCallPart] | None = None
-    tool_call_id: str | None = None
-    name: str | None = None
 
 
 class ChatCompletionRequest(BaseModel):
     model_config = ConfigDict(extra="ignore")
-
-    model: str = "notion-ai"
+    model: str = "arena-gpt-4o"
     messages: list[ChatMessage]
     stream: bool = False
-    user: str | None = None
     temperature: float | None = None
     max_tokens: int | None = None
-    tools: list[Any] | None = None
-    tool_choice: str | dict[str, Any] | None = None
-    parallel_tool_calls: bool | None = True
-
-
-def _tools_payload(req: ChatCompletionRequest) -> list[dict[str, Any]]:
-    if not req.tools:
-        return []
-    out: list[dict[str, Any]] = []
-    for item in req.tools:
-        if isinstance(item, dict):
-            out.append(item)
-        elif isinstance(item, ToolDefinition):
-            out.append(item.model_dump())
-        elif hasattr(item, "model_dump"):
-            out.append(item.model_dump())
-    return out
-
-
-def _resolved_request_model(req: ChatCompletionRequest, settings: Settings) -> str:
-    return resolve_model(
-        normalize_request_model(req.model) or settings.default_model,
-        default=settings.default_model,
-        alias_map=get_cached_alias_map(),
-    )
-
-
-def _resolve_thread_id(req: ChatCompletionRequest, settings: Settings) -> str | None:
-    if not req.user:
-        return None
-
-    resolved = _resolved_request_model(req, settings)
-    previous = _session_models.get(req.user)
-    if previous and previous != resolved:
-        log.info(
-            "Session %r model changed %r -> %r — dropping Notion thread",
-            req.user,
-            previous,
-            resolved,
-        )
-        _session_threads.pop(req.user, None)
-    _session_models[req.user] = resolved
-
-    return _session_threads.get(req.user)
-
-
-def _remember_thread(req: ChatCompletionRequest, thread_id: str, settings: Settings) -> None:
-    if req.user:
-        _session_threads[req.user] = thread_id
-        _session_models[req.user] = _resolved_request_model(req, settings)
-
-
-def _take_pooled_thread(req: ChatCompletionRequest, settings: Settings) -> str | None:
-    """Reuse a shared Notion thread for up to thread_reuse_limit completions."""
-    limit = settings.thread_reuse_limit
-    if limit <= 0:
-        return None
-    model = _resolved_request_model(req, settings)
-    slot = _reuse_pool.get(model)
-    if not slot:
-        return None
-    thread_id = slot.get("thread_id")
-    uses = int(slot.get("uses") or 0)
-    if not isinstance(thread_id, str) or not thread_id:
-        return None
-    if uses >= limit:
-        log.info(
-            "Thread reuse limit reached (%d/%d) for model %r — opening new Notion chat",
-            uses,
-            limit,
-            model,
-        )
-        _reuse_pool.pop(model, None)
-        return None
-    log.info(
-        "Reusing Notion thread %s (%d/%d) model=%r",
-        thread_id[:8],
-        uses + 1,
-        limit,
-        model,
-    )
-    return thread_id
-
-
-def _record_pooled_thread(req: ChatCompletionRequest, thread_id: str, settings: Settings) -> None:
-    limit = settings.thread_reuse_limit
-    if limit <= 0 or not thread_id:
-        return
-    model = _resolved_request_model(req, settings)
-    slot = _reuse_pool.get(model)
-    if slot and slot.get("thread_id") == thread_id:
-        slot["uses"] = int(slot.get("uses") or 0) + 1
-    else:
-        _reuse_pool[model] = {"thread_id": thread_id, "uses": 1}
-        log.info(
-            "Started reusable Notion thread %s (1/%d) model=%r",
-            thread_id[:8],
-            limit,
-            model,
-        )
-
-
-def _resolve_request_thread(
-    req: ChatCompletionRequest,
-    settings: Settings,
-    *,
-    ide_agent: bool,
-    tools_active: bool,
-) -> str | None:
-    # Prefer explicit OpenAI `user` session continuity for normal chat.
-    if not ide_agent and not tools_active:
-        thread_id = _resolve_thread_id(req, settings)
-        if thread_id:
-            return thread_id
-    return _take_pooled_thread(req, settings)
-
-
-def _remember_request_thread(
-    req: ChatCompletionRequest,
-    thread_id: str,
-    settings: Settings,
-    *,
-    ide_agent: bool,
-    tools_active: bool,
-) -> None:
-    if not ide_agent and not tools_active:
-        _remember_thread(req, thread_id, settings)
-    # Shared pool is only for requests without an OpenAI `user` session key.
-    if not req.user:
-        _record_pooled_thread(req, thread_id, settings)
-
-
-async def _ensure_model_aliases(client: NotionAIClient, settings: Settings) -> None:
-    if get_cached_alias_map() is not None:
-        return
-    try:
-        raw = await client.fetch_available_models()
-        data = list_openai_models_from_notion(
-            raw,
-            default_notion_id=settings.default_model,
-        )
-        cache_openai_models(data, parse_available_models(raw))
-    except NotionChatError as e:
-        log.warning("Could not prefetch Notion model aliases: %s", e)
-
-
-def _assistant_message(result: ChatResult) -> dict[str, Any]:
-    msg: dict[str, Any] = {"role": "assistant"}
-    if result.tool_calls:
-        msg["content"] = result.text
-        msg["tool_calls"] = result.tool_calls
-    else:
-        msg["content"] = result.text or ""
-    return msg
-
-
-def _usage(result: ChatResult) -> dict[str, int]:
-    return {
-        "prompt_tokens": result.input_tokens,
-        "completion_tokens": result.output_tokens,
-        "total_tokens": result.input_tokens + result.output_tokens,
-    }
+    top_p: float | None = None
+    stop: str | list[str] | None = None
 
 
 def _chunk(
@@ -263,6 +68,7 @@ def _chunk(
     delta: dict[str, Any],
     finish_reason: str | None = None,
 ) -> str:
+    """Create an SSE chunk."""
     payload = {
         "id": completion_id,
         "object": "chat.completion.chunk",
@@ -273,549 +79,194 @@ def _chunk(
     return f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
 
 
-def _bridge_ide_agent(
-    result: ChatResult,
-    *,
-    req: ChatCompletionRequest,
-    tools: list[dict[str, Any]],
-    prompt: str,
-    ide_agent: bool,
-    tools_active: bool,
-) -> ChatResult:
-    if not ide_agent or not tools_active:
-        return result
-    text, tool_calls = bridge_ide_agent_response(
-        messages=req.messages,
-        notion_text=result.text,
-        notion_tool_calls=result.tool_calls,
-        client_tools=tools,
-        prompt=prompt,
-    )
-    if tool_calls:
-        log.info(
-            "IDE bridge tool_calls=%s (notion text_len=%s)",
-            [(tc.get("function") or {}).get("name") for tc in tool_calls],
-            len(result.text or ""),
-        )
-        return ChatResult(
-            text=text,
-            thread_id=result.thread_id,
-            model=result.model,
-            tool_calls=tool_calls,
-            input_tokens=result.input_tokens,
-            output_tokens=result.output_tokens,
-        )
-    if looks_like_tool_denial(result.text):
-        log.info("IDE bridge suppressed Notion tool denial (text_len=%s)", len(result.text or ""))
-        return ChatResult(
-            text=None,
-            thread_id=result.thread_id,
-            model=result.model,
-            tool_calls=None,
-            input_tokens=result.input_tokens,
-            output_tokens=result.output_tokens,
-        )
-    return ChatResult(
-        text=text if text is not None else result.text,
-        thread_id=result.thread_id,
-        model=result.model,
-        tool_calls=None,
-        input_tokens=result.input_tokens,
-        output_tokens=result.output_tokens,
-    )
-
-
-async def _bridge_ide_agent_async(
-    client: NotionAIClient,
-    result: ChatResult,
-    *,
-    req: ChatCompletionRequest,
-    tools: list[dict[str, Any]],
-    prompt: str,
-    system: str | None,
-    ide_agent: bool,
-    tools_active: bool,
-) -> ChatResult:
-    bridged = _bridge_ide_agent(
-        result,
-        req=req,
-        tools=tools,
-        prompt=prompt,
-        ide_agent=ide_agent,
-        tools_active=tools_active,
-    )
-    if bridged.tool_calls or not ide_agent or not tools_active:
-        return bridged
-
-    should_retry = looks_like_tool_denial(result.text) or looks_like_coding_task_prompt(prompt)
-    if not should_retry:
-        return bridged
-
-    log.info("IDE bridge retry: no tool_calls after compile (denial=%s)", looks_like_tool_denial(result.text))
-    retry_system = (system or "").strip()
-    append = build_tool_denial_retry_append()
-    retry_system = f"{retry_system}\n\n{append}".strip() if retry_system else append
-    retry = await client.complete(
-        prompt=prompt,
-        system=retry_system,
-        model=req.model,
-        thread_id=None,
-        tools_active=tools_active,
-        ide_agent_mode=ide_agent,
-        client_tools=tools,
-    )
-    return _bridge_ide_agent(
-        retry,
-        req=req,
-        tools=tools,
-        prompt=prompt,
-        ide_agent=ide_agent,
-        tools_active=tools_active,
-    )
-
-
-async def _stream_openai(
-    client: NotionAIClient,
-    req: ChatCompletionRequest,
-    system: str | None,
-    prompt: str,
-    thread_id: str | None,
-    settings: Settings,
-    *,
-    tools: list[dict[str, Any]],
-    tools_active: bool,
-    ide_agent: bool,
-    content_mode: bool = False,
-) -> AsyncIterator[str]:
-    completion_id = f"chatcmpl-{uuid.uuid4().hex[:24]}"
-    created = int(time.time())
-
-    try:
-        deltas, active_thread_id, finalize = await client.stream_deltas(
-            prompt=prompt,
-            system=system,
-            model=req.model,
-            thread_id=thread_id,
-            tools_active=tools_active,
-            ide_agent_mode=ide_agent,
-            client_tools=tools,
-            buffer_until_complete=False,
-        )
-
-        if tools_active:
-            buffered: list[str] = []
-            async for piece in deltas:
-                buffered.append(piece)
-            try:
-                result = finalize()
-            except NotionChatError:
-                empty = ChatResult(
-                    text=None,
-                    thread_id=active_thread_id,
-                    model=req.model,
-                    tool_calls=None,
-                )
-                result = await _bridge_ide_agent_async(
-                    client,
-                    empty,
-                    req=req,
-                    tools=tools,
-                    prompt=prompt,
-                    system=system,
-                    ide_agent=ide_agent,
-                    tools_active=tools_active,
-                )
-                if not result.tool_calls and not (result.text or "").strip():
-                    raise
-            else:
-                result = await _bridge_ide_agent_async(
-                    client,
-                    result,
-                    req=req,
-                    tools=tools,
-                    prompt=prompt,
-                    system=system,
-                    ide_agent=ide_agent,
-                    tools_active=tools_active,
-                )
-            _remember_request_thread(
-                req,
-                result.thread_id,
-                settings,
-                ide_agent=ide_agent,
-                tools_active=tools_active,
-            )
-
-            if result.tool_calls:
-                yield _chunk(
-                    completion_id=completion_id,
-                    created=created,
-                    model=req.model,
-                    delta={"role": "assistant", "content": None},
-                )
-                for index, tc in enumerate(result.tool_calls):
-                    fn = tc.get("function") or {}
-                    yield _chunk(
-                        completion_id=completion_id,
-                        created=created,
-                        model=req.model,
-                        delta={
-                            "tool_calls": [
-                                {
-                                    "index": index,
-                                    "id": tc.get("id"),
-                                    "type": "function",
-                                    "function": {
-                                        "name": fn.get("name", ""),
-                                        "arguments": "",
-                                    },
-                                }
-                            ]
-                        },
-                    )
-                    args = str(fn.get("arguments", ""))
-                    step = max(1, len(args) // 4)
-                    for pos in range(0, len(args), step):
-                        yield _chunk(
-                            completion_id=completion_id,
-                            created=created,
-                            model=req.model,
-                            delta={
-                                "tool_calls": [
-                                    {
-                                        "index": index,
-                                        "function": {"arguments": args[pos : pos + step]},
-                                    }
-                                ]
-                            },
-                        )
-                yield _chunk(
-                    completion_id=completion_id,
-                    created=created,
-                    model=req.model,
-                    delta={},
-                    finish_reason="tool_calls",
-                )
-            else:
-                pieces = buffered
-                if not pieces and result.text:
-                    pieces = [result.text]
-                for piece in pieces:
-                    yield _chunk(
-                        completion_id=completion_id,
-                        created=created,
-                        model=req.model,
-                        delta={"content": piece},
-                    )
-                yield _chunk(
-                    completion_id=completion_id,
-                    created=created,
-                    model=req.model,
-                    delta={},
-                    finish_reason="stop",
-                )
-        else:
-            # Live-stream deltas. Notion may rewrite earlier blocks; client.py emits
-            # <<<MUGHU_STREAM_REPLACE>>> snapshots for those — keep streaming.
-            live_parts: list[str] = []
-            async for piece in deltas:
-                live_parts.append(piece)
-                yield _chunk(
-                    completion_id=completion_id,
-                    created=created,
-                    model=req.model,
-                    delta={"content": piece},
-                )
-            result = finalize()
-            _remember_request_thread(
-                req,
-                result.thread_id,
-                settings,
-                ide_agent=ide_agent,
-                tools_active=tools_active,
-            )
-
-            # Final authoritative snapshot if live stream drifted from cleaned result.
-            final_text = (result.text or "").strip()
-            live_joined = "".join(live_parts)
-            replace_mark = "<<<MUGHU_STREAM_REPLACE>>>\n"
-            live_text = (
-                live_joined[live_joined.rfind(replace_mark) + len(replace_mark) :]
-                if replace_mark in live_joined
-                else live_joined
-            ).strip()
-            if final_text and (
-                content_mode
-                and (
-                    len(final_text) > len(live_text) + 40
-                    or (
-                        live_text
-                        and final_text != live_text
-                        and not final_text.startswith(live_text[: min(200, len(live_text))])
-                    )
-                )
-            ):
-                replace_payload = f"{replace_mark}{final_text}"
-                step = 600
-                for pos in range(0, len(replace_payload), step):
-                    yield _chunk(
-                        completion_id=completion_id,
-                        created=created,
-                        model=req.model,
-                        delta={"content": replace_payload[pos : pos + step]},
-                    )
-
-            finish_reason = "tool_calls" if result.tool_calls else "stop"
-            if result.tool_calls:
-                yield _chunk(
-                    completion_id=completion_id,
-                    created=created,
-                    model=req.model,
-                    delta={"role": "assistant", "tool_calls": result.tool_calls},
-                )
-            yield _chunk(
-                completion_id=completion_id,
-                created=created,
-                model=req.model,
-                delta={},
-                finish_reason=finish_reason,
-            )
-
-        yield "data: [DONE]\n\n"
-    except NotionChatError as e:
-        err = {"error": {"message": str(e), "type": "notion_error", "code": e.status_code}}
-        yield f"data: {json.dumps(err)}\n\n"
-    finally:
-        await client.aclose()
-
-
-import os
-import sys
-import asyncio
-from contextlib import asynccontextmanager
-
-@asynccontextmanager
 async def lifespan(app: FastAPI):
-    loop = asyncio.get_running_loop()
-    # Save the original exception handler if set
-    original_handler = loop.get_exception_handler()
-
-    def win_fatal_loop_exception_handler(loop, context):
-        exception = context.get("exception")
-        message = context.get("message", "")
-        
-        is_fatal = False
-        if exception:
-            winerr = getattr(exception, "winerror", None)
-            if winerr in (121, 10053, 10054):
-                is_fatal = True
-            else:
-                err_msg = str(exception)
-                if any(code in err_msg for code in ("[WinError 121]", "[WinError 10054]", "[WinError 10053]")):
-                    is_fatal = True
-                elif isinstance(exception, (ConnectionResetError, ConnectionAbortedError)):
-                    is_fatal = True
-        elif "event loop self pipe" in message or "SelectorThread" in message:
-            is_fatal = True
-
-        if is_fatal:
-            log.critical(
-                "Fatal Windows event loop socket/pipe error detected (caused by PC waking up from hibernation/sleep). "
-                "The event loop has been corrupted and cannot recover. Terminating process immediately to prevent hang... "
-                "Exception: %s, Message: %s",
-                exception,
-                message,
-            )
-            os._exit(1)
-
-        if original_handler:
-            original_handler(loop, context)
-        else:
-            loop.default_exception_handler(context)
-
-    loop.set_exception_handler(win_fatal_loop_exception_handler)
-
-    settings = getattr(app.state, "settings", None)
-    if settings is not None:
-        try:
-            account = load_account_from_env(settings)
-            settings.thread_state_dir.mkdir(parents=True, exist_ok=True)
-            client = NotionAIClient(
-                account,
-                base_url=settings.base_url,
-                thread_state_dir=settings.thread_state_dir,
-            )
-            try:
-                raw = await client.fetch_available_models()
-                data = list_openai_models_from_notion(
-                    raw,
-                    default_notion_id=settings.default_model,
-                )
-                cache_openai_models(data, parse_available_models(raw))
-                log.info("Prefetched %d Notion model aliases on startup", len(data))
-            finally:
-                await client.aclose()
-        except Exception as e:
-            log.warning("Could not prefetch Notion models on startup: %s", e)
-
+    """Application lifespan handler."""
     yield
 
 
 def create_app(settings: Settings | None = None) -> FastAPI:
+    """Create FastAPI application."""
     settings = settings or load_settings()
-    app = FastAPI(title="NotionChat", version="0.3.1", lifespan=lifespan)
+    app = FastAPI(
+        title="ArenaChat",
+        description="OpenAI-compatible API for Arena.ai (Chatbot Arena)",
+        version="1.0.0",
+        lifespan=lifespan,
+    )
     app.state.settings = settings
 
     def verify_key(authorization: str | None = Header(default=None)) -> None:
+        """Verify API key from Authorization header."""
         if not authorization or not authorization.startswith("Bearer "):
             raise HTTPException(status_code=401, detail="Missing Bearer token")
         token = authorization.removeprefix("Bearer ").strip()
         if token != settings.api_key:
             raise HTTPException(status_code=401, detail="Invalid API key")
 
-    def get_client() -> NotionAIClient:
-        account = load_account_from_env(settings)
-        settings.thread_state_dir.mkdir(parents=True, exist_ok=True)
-        return NotionAIClient(
-            account,
-            base_url=settings.base_url,
-            thread_state_dir=settings.thread_state_dir,
-        )
-
     @app.get("/healthz")
     async def healthz() -> dict[str, str]:
+        """Health check endpoint."""
         return {"status": "ok"}
 
     @app.get("/v1/models")
     async def list_models(_: None = Depends(verify_key)) -> dict[str, Any]:
-        cached = get_cached_openai_models()
-        if cached is not None:
-            return {"object": "list", "data": cached}
+        """List available models."""
+        account = load_account_from_env(settings)
+        models = DEFAULT_ARENA_MODELS.copy()
 
-        client = get_client()
         try:
-            raw = await client.fetch_available_models()
-            data = list_openai_models_from_notion(
-                raw,
-                default_notion_id=settings.default_model,
-            )
-            cache_openai_models(data, parse_available_models(raw))
-            return {"object": "list", "data": data}
-        except NotionChatError as e:
-            log.warning("getAvailableModels failed (%s), using static model list", e)
-            return {
-                "object": "list",
-                "data": list_openai_models(settings.default_model),
-            }
-        finally:
-            await client.aclose()
+            # Try to fetch real models from arena.ai
+            client = ArenaHttpClient(account)
+            real_models = await client.get_models()
+            await client.close()
+
+            if real_models:
+                models = [
+                    {
+                        "id": m.id,
+                        "object": "model",
+                        "created": int(time.time()),
+                        "owned_by": m.provider or "arena",
+                        "description": m.description,
+                    }
+                    for m in real_models
+                ]
+                log.info("Fetched %d models from arena.ai", len(models))
+        except Exception as e:
+            log.warning("Could not fetch arena models, using defaults: %s", e)
+
+        return {"object": "list", "data": models}
 
     @app.post("/v1/chat/completions")
     async def chat_completions(
         req: ChatCompletionRequest,
         _: None = Depends(verify_key),
-        x_content_generation: str | None = Header(None, alias="X-Content-Generation"),
     ) -> Any:
+        """Handle chat completion requests."""
         try:
-            tools = normalize_tools(_tools_payload(req))
-            content_mode = bool(x_content_generation)
-            system, prompt, tools_active, ide_agent, tools = prepare_chat_input(
-                req.messages,
-                tools=tools,
-                tool_choice=req.tool_choice,
-                content_mode=content_mode,
+            account = load_account_from_env(settings)
+            client = ArenaHttpClient(account)
+
+            # Convert messages
+            messages = [
+                {"role": m.role, "content": m.content or ""}
+                for m in req.messages
+            ]
+
+            log.info(
+                "chat stream=%s model=%s msgs=%d",
+                req.stream,
+                req.model,
+                len(messages),
             )
-            if not tools and is_ide_agent_messages(req.messages):
-                log.warning("Cursor-like request but tools[] empty after prepare_chat_input")
-            client = get_client()
-            try:
-                # Prefetch aliases before resolve/log so names like glm-5.2 map cleanly.
-                await _ensure_model_aliases(client, settings)
-                log.info(
-                    "chat stream=%s model=%s resolved=%s tools=%d tools_active=%s ide_agent=%s tool_names=%s msgs=%d",
-                    req.stream,
-                    normalize_request_model(req.model) or req.model,
-                    _resolved_request_model(req, settings),
-                    len(tools),
-                    tools_active,
-                    ide_agent,
-                    sorted(client_tool_names(tools))[:8],
-                    len(req.messages),
+
+            if req.stream:
+                return StreamingResponse(
+                    _stream_response(client, req, settings),
+                    media_type="text/event-stream",
                 )
-                thread_id = _resolve_request_thread(
-                    req,
-                    settings,
-                    ide_agent=ide_agent,
-                    tools_active=tools_active,
-                )
-                if req.stream:
-                    return StreamingResponse(
-                        _stream_openai(
-                            client,
-                            req,
-                            system,
-                            prompt,
-                            thread_id,
-                            settings,
-                            tools=tools,
-                            tools_active=tools_active,
-                            ide_agent=ide_agent,
-                            content_mode=content_mode,
-                        ),
-                        media_type="text/event-stream",
-                    )
-                result = await client.complete(
-                    prompt=prompt,
-                    system=system,
-                    model=req.model,
-                    thread_id=thread_id,
-                    tools_active=tools_active,
-                    ide_agent_mode=ide_agent,
-                    client_tools=tools,
-                )
-                result = await _bridge_ide_agent_async(
-                    client,
-                    result,
-                    req=req,
-                    tools=tools,
-                    prompt=prompt,
-                    system=system,
-                    ide_agent=ide_agent,
-                    tools_active=tools_active,
-                )
-                log.info(
-                    "chat result text_len=%s tool_calls=%s",
-                    len(result.text or ""),
-                    [((tc.get("function") or {}).get("name")) for tc in (result.tool_calls or [])],
-                )
-                _remember_request_thread(
-                    req,
-                    result.thread_id,
-                    settings,
-                    ide_agent=ide_agent,
-                    tools_active=tools_active,
-                )
-                completion_id = f"chatcmpl-{uuid.uuid4().hex[:24]}"
-                finish_reason = "tool_calls" if result.tool_calls else "stop"
-                return {
-                    "id": completion_id,
-                    "object": "chat.completion",
-                    "created": int(time.time()),
-                    "model": req.model,
-                    "choices": [
-                        {
-                            "index": 0,
-                            "message": _assistant_message(result),
-                            "finish_reason": finish_reason,
-                        }
-                    ],
-                    "usage": _usage(result),
-                }
-            finally:
-                await client.aclose()
+
+            # Non-streaming
+            result = await client.chat_completion(
+                model=req.model,
+                messages=messages,
+                temperature=req.temperature or 1.0,
+                max_tokens=req.max_tokens,
+            )
+            await client.close()
+
+            return _format_response(result, req.model)
+
         except NotionChatError as e:
-            if e.status_code == 403:
-                log.warning("chat/completions 403: %s", e)
+            log.error("Chat completion error: %s", e)
             raise HTTPException(status_code=e.status_code, detail=str(e)) from e
+        except Exception as e:
+            log.error("Unexpected error: %s", e)
+            raise HTTPException(status_code=500, detail=str(e)) from e
 
     return app
+
+
+async def _stream_response(
+    client: ArenaHttpClient,
+    req: ChatCompletionRequest,
+    settings: Settings,
+) -> AsyncIterator[str]:
+    """Stream chat completion response."""
+    completion_id = f"chatcmpl-{uuid.uuid4().hex[:24]}"
+    created = int(time.time())
+
+    try:
+        messages = [
+            {"role": m.role, "content": m.content or ""}
+            for m in req.messages
+        ]
+
+        async for chunk in client.chat_completion_stream(
+            model=req.model,
+            messages=messages,
+            temperature=req.temperature or 1.0,
+            max_tokens=req.max_tokens,
+        ):
+            if chunk.content:
+                yield _chunk(
+                    completion_id=completion_id,
+                    created=created,
+                    model=req.model,
+                    delta={"content": chunk.content},
+                )
+            if chunk.done:
+                yield _chunk(
+                    completion_id=completion_id,
+                    created=created,
+                    model=req.model,
+                    delta={},
+                    finish_reason=chunk.finish_reason or "stop",
+                )
+
+        yield "data: [DONE]\n\n"
+
+    except NotionChatError as e:
+        err = {"error": {"message": str(e), "type": "arena_error", "code": e.status_code}}
+        yield f"data: {json.dumps(err)}\n\n"
+    finally:
+        await client.close()
+
+
+def _format_response(data: dict[str, Any], model: str) -> dict[str, Any]:
+    """Format arena.ai response to OpenAI format."""
+    content = ""
+    finish_reason = "stop"
+
+    # Try different content extraction methods
+    if "choices" in data and data["choices"]:
+        content = data["choices"][0].get("message", {}).get("content", "")
+        finish_reason = data["choices"][0].get("finish_reason", "stop")
+    elif "text" in data:
+        content = data["text"]
+    elif "message" in data:
+        content = data["message"].get("content", "")
+    elif "content" in data:
+        content = data["content"]
+
+    return {
+        "id": f"chatcmpl-{uuid.uuid4().hex[:24]}",
+        "object": "chat.completion",
+        "created": int(time.time()),
+        "model": model,
+        "choices": [
+            {
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": content,
+                },
+                "finish_reason": finish_reason,
+            }
+        ],
+        "usage": data.get("usage", {
+            "prompt_tokens": 0,
+            "completion_tokens": 0,
+            "total_tokens": 0,
+        }),
+    }
