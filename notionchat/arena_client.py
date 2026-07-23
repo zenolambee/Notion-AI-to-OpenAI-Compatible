@@ -160,19 +160,40 @@ class ArenaHttpClient:
             stream=False,
         )
 
+        log.info("POST %s payload_keys=%s", ARENA_API_CHAT, list(payload.keys()))
         try:
             resp = await client.post(ARENA_API_CHAT, headers=headers, json=payload)
+            body_preview = resp.text[:1000]
+            log.info(
+                "arena chat response status=%s ct=%s len=%s body[:1000]=%r",
+                resp.status_code,
+                resp.headers.get("content-type"),
+                resp.headers.get("content-length"),
+                body_preview,
+            )
             if resp.status_code != 200:
-                log.error(
-                    "Chat completion failed: %s - %s",
-                    resp.status_code,
-                    resp.text[:200],
+                # Surface the real upstream error instead of returning an empty 200.
+                from notionchat.exceptions import NotionChatError
+                raise NotionChatError(
+                    f"arena.ai chat failed: HTTP {resp.status_code} - {body_preview}",
+                    status_code=502,
                 )
-                return {"choices": [{"message": {"content": ""}}]}
+            ctype = (resp.headers.get("content-type") or "").lower()
+            if "json" not in ctype:
+                # Upstream returned NDJSON / SSE / HTML — the OpenAI-shaped parser
+                # will silently produce empty content, so raise instead.
+                from notionchat.exceptions import NotionChatError
+                raise NotionChatError(
+                    f"arena.ai returned non-JSON body (content-type={ctype!r}); "
+                    f"the /api/chat endpoint used here is not the real arena.ai "
+                    f"chat endpoint. First 500 bytes: {body_preview[:500]}",
+                    status_code=502,
+                )
             return resp.json()
         except httpx.HTTPError as e:
             log.error("HTTP error in chat completion: %s", e)
-            return {"choices": [{"message": {"content": ""}}]}
+            from notionchat.exceptions import NotionChatError
+            raise NotionChatError(f"arena.ai network error: {e}", status_code=502) from e
 
     async def chat_completion_stream(
         self,
@@ -198,6 +219,7 @@ class ArenaHttpClient:
             stream=True,
         )
 
+        log.info("STREAM POST %s payload_keys=%s", ARENA_API_CHAT, list(payload.keys()))
         try:
             async with client.stream(
                 "POST",
@@ -205,20 +227,43 @@ class ArenaHttpClient:
                 headers=headers,
                 json=payload,
             ) as resp:
+                log.info(
+                    "arena stream response status=%s ct=%s",
+                    resp.status_code,
+                    resp.headers.get("content-type"),
+                )
                 if resp.status_code != 200:
-                    text = await resp.aread()
-                    log.error("Streaming failed: %s - %s", resp.status_code, text[:200])
-                    return
+                    text = (await resp.aread()).decode("utf-8", errors="replace")
+                    log.error("Streaming failed: %s - %s", resp.status_code, text[:500])
+                    from notionchat.exceptions import NotionChatError
+                    raise NotionChatError(
+                        f"arena.ai stream failed: HTTP {resp.status_code} - {text[:500]}",
+                        status_code=502,
+                    )
 
+                saw_any_content = False
+                sampled: list[str] = []
                 async for line in resp.aiter_lines():
-                    if line.strip():
-                        chunk = self._parse_stream_chunk(line, model)
-                        if chunk:
-                            yield chunk
+                    if not line.strip():
+                        continue
+                    if len(sampled) < 5:
+                        sampled.append(line[:200])
+                    chunk = self._parse_stream_chunk(line, model)
+                    if chunk:
+                        if chunk.content:
+                            saw_any_content = True
+                        yield chunk
+
+                if not saw_any_content:
+                    log.warning(
+                        "arena stream returned 200 but no content parsed. "
+                        "First lines: %r",
+                        sampled,
+                    )
         except httpx.HTTPError as e:
             log.error("HTTP error in streaming: %s", e)
-        except Exception as e:
-            log.error("Error in streaming: %s", e)
+            from notionchat.exceptions import NotionChatError
+            raise NotionChatError(f"arena.ai network error: {e}", status_code=502) from e
 
     def _build_chat_payload(
         self,

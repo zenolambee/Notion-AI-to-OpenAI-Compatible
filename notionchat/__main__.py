@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import logging
 import os
 import sys
 from pathlib import Path
@@ -22,9 +23,17 @@ def cmd_serve(_: argparse.Namespace) -> int:
     home = os.getenv("ARENACHAT_HOME", "").strip()
     if home:
         os.chdir(Path(home).expanduser().resolve())
+    # Make notionchat.* loggers visible under uvicorn.
+    log_level = os.getenv("ARENACHAT_LOG_LEVEL", "INFO").upper()
+    logging.basicConfig(
+        level=log_level,
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+    )
+    for name in ("notionchat", "notionchat.arena_client", "notionchat.openai_api"):
+        logging.getLogger(name).setLevel(log_level)
     settings = load_settings()
     app = create_app(settings)
-    uvicorn.run(app, host=settings.host, port=settings.port, log_level="info")
+    uvicorn.run(app, host=settings.host, port=settings.port, log_level=log_level.lower())
     return 0
 
 
