@@ -48,6 +48,7 @@ class Settings:
     account_path: Path
     base_url: str
     default_model: str
+    model_catalog_path: Path = Path("models.json")
 
 
 def _env_path(name: str, default: str) -> Path:
@@ -67,7 +68,10 @@ def load_settings() -> Settings:
         port=int(os.getenv("ARENACHAT_PORT", "1995")),
         account_path=_env_path("ARENACHAT_ACCOUNT", "arena_account.json"),
         base_url=os.getenv("ARENACHAT_BASE_URL", DEFAULT_BASE_URL).rstrip("/"),
-        default_model=os.getenv("ARENACHAT_DEFAULT_MODEL", "arena-gpt-4o"),
+        # Arena model ids are account-specific UUIDs. A catalog avoids stale,
+        # fabricated aliases such as `arena-gpt-4o`.
+        default_model=os.getenv("ARENACHAT_DEFAULT_MODEL", ""),
+        model_catalog_path=_env_path("ARENACHAT_MODELS_FILE", "models.json"),
     )
 
 

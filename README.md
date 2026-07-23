@@ -110,7 +110,8 @@ Edit `.env`:
 | `ARENACHAT_PORT` | Port (default `1995`) |
 | `ARENACHAT_ACCOUNT` | Path to account JSON (default `arena_account.json`) |
 | `ARENACHAT_BASE_URL` | Arena API base URL (default `https://arena.ai/api`) |
-| `ARENACHAT_DEFAULT_MODEL` | Default model ID |
+| `ARENACHAT_DEFAULT_MODEL` | Optional raw Arena model ID returned by `/v1/models` |
+| `ARENACHAT_MODELS_FILE` | Optional local model-catalog fallback (default: `models.json`) |
 | `ARENACHAT_HOME` | Optional — absolute project folder |
 | `ARENA_COOKIE` | Full `document.cookie` from arena.ai |
 | `ARENACHAT_PROXY` | Optional — HTTP/SOCKS proxy for Arena egress |
@@ -154,7 +155,7 @@ curl http://127.0.0.1:1995/v1/chat/completions \
   -H "Authorization: Bearer sk-arena-chat" \
   -H "Content-Type: application/json" \
   -d '{
-    "model": "arena-gpt-4o",
+    "model": "<raw-model-id-from-v1-models>",
     "messages": [{"role": "user", "content": "Say hello in one sentence."}]
   }'
 
@@ -163,28 +164,31 @@ curl http://127.0.0.1:1995/v1/chat/completions \
   -H "Authorization: Bearer sk-arena-chat" \
   -H "Content-Type: application/json" \
   -d '{
-    "model": "arena-gpt-4o",
+    "model": "<raw-model-id-from-v1-models>",
     "messages": [{"role": "user", "content": "Count to 5"}],
     "stream": true
   }'
 ```
 
-## Available Models
+## Models
 
-| Model ID | Description |
-|----------|-------------|
-| `arena-gpt-4o` | GPT-4o |
-| `arena-claude-3-5-sonnet` | Claude 3.5 Sonnet |
-| `arena-gemini-1.5-pro` | Gemini 1.5 Pro |
-| `arena-claude-3-opus` | Claude 3 Opus |
-| `arena-gpt-4-turbo` | GPT-4 Turbo |
-| `arena-gpt-4` | GPT-4 |
-| `arena-claude-3-sonnet` | Claude 3 Sonnet |
-| `arena-claude-3-haiku` | Claude 3 Haiku |
-| `arena-gemini-1.5-flash` | Gemini 1.5 Flash |
-| `arena-llama-3-70b` | Llama 3 70B |
-| `arena-llama-3-8b` | Llama 3 8B |
-| `arena-mixtral-8x7b` | Mixtral 8x7B |
+Arena model identifiers are dynamic and account-specific. The legacy aliases shown
+in older releases (for example, `arena-gpt-4o`) are not valid Arena model IDs and
+will produce a 404. First retrieve the catalog and use an `id` exactly as returned:
+
+```bash
+curl http://127.0.0.1:1995/v1/models \
+  -H "Authorization: Bearer sk-arena-chat"
+```
+
+Use the raw `id` in your OpenAI client. The corresponding `description` is the
+human-readable display name. If Arena's catalog endpoint is temporarily
+unavailable—or returns survey/metadata records instead of model UUIDs—copy the
+correct model entries to `models.json` (or start with `models.example.json`) and
+set `ARENACHAT_MODELS_FILE` if it lives elsewhere. A populated local catalog
+takes precedence over the live endpoint. Never use the display name in place of
+an ID unless it appears as the raw `id`.
+
 
 ## Cursor / 9router setup
 
@@ -192,7 +196,7 @@ curl http://127.0.0.1:1995/v1/chat/completions \
 2. In your router or Cursor custom model settings:
    - **Base URL:** `http://127.0.0.1:1995/v1`
    - **API key:** value of `ARENACHAT_API_KEY` from `.env` (default: `sk-arena-chat`)
-   - **Model:** e.g. `arena-gpt-4o`
+   - **Model:** a raw `id` returned by `GET /v1/models`
 
 ## Project layout
 
@@ -200,6 +204,7 @@ curl http://127.0.0.1:1995/v1/chat/completions \
 notionchat/          # Python package (API, client, account management)
 scripts/             # PATH launchers
 postman/             # Postman collection
+models.example.json  # Template for an optional local Arena model catalog
 .env.example         # Copy to .env (never commit .env)
 pyproject.toml       # package + CLI entry points
 requirements.txt
@@ -215,6 +220,7 @@ requirements.txt
 
 | Problem | Things to try |
 |---------|---------------|
+| Model not found / 404 | Call `/v1/models` and configure its raw model `id`; do not use `arena-gpt-4o` |
 | Empty assistant response | Refresh cookie; check if Arena.ai is accessible |
 | 401 Unauthorized | Verify `ARENACHAT_API_KEY` matches in .env and client |
 | Cookie expired | Re-login to arena.ai and update `ARENA_COOKIE` |

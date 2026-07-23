@@ -22,3 +22,5 @@ notion_account.json.example
 _scrub_history.py
 .git.backup-rewrite/
 arena_account.json
+
+models.json

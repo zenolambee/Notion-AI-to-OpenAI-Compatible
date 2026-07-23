@@ -1,0 +1,10 @@
+{
+  "models": [
+    {
+      "id": "REPLACE_WITH_A_RAW_ARENA_MODEL_UUID",
+      "name": "My Arena model",
+      "provider": "arena",
+      "description": "Copy a model entry from GET /v1/models"
+    }
+  ]
+}
