@@ -40,14 +40,61 @@ UUID_RE = re.compile(
 )
 
 
+_JUNK_NAME_MARKERS = (
+    '"everyone" survey',
+    "everyone survey",
+    "survey - (",
+    "(Arena =",
+    "(Age =",
+    "(Geo =",
+)
+
+
 def _looks_like_model_entry(obj: Any) -> bool:
+    """Return True only for entries that look like real chat/image models.
+
+    Arena.ai's client bundle also carries analytics/survey rows keyed by
+    UUID+publicName that would otherwise match. Distinguish real models by:
+      * excluding names matching known analytics/survey patterns
+      * requiring `organization` when present
+      * requiring at least one output capability when `capabilities` is
+        present (mirroring LMArenaBridge's filter)
+    We stay a bit lenient when arena's bundle omits capabilities/organization
+    entirely (some rare model entries), rejecting only clear analytics junk.
+    """
     if not isinstance(obj, dict):
         return False
     mid = obj.get("id")
     pub = obj.get("publicName") or obj.get("public_name") or obj.get("name")
-    if not isinstance(mid, str) or not isinstance(pub, str):
+    if not isinstance(mid, str) or not isinstance(pub, str) or not pub:
         return False
     if not UUID_RE.match(mid):
+        return False
+
+    # Hard reject analytics / survey buckets that share the (id, publicName)
+    # shape but aren't real models.
+    low = pub.lower()
+    if any(marker.lower() in low for marker in _JUNK_NAME_MARKERS):
+        return False
+
+    org = str(obj.get("organization") or "").strip()
+    caps = obj.get("capabilities")
+    outs = caps.get("outputCapabilities") if isinstance(caps, dict) else None
+
+    if isinstance(outs, dict):
+        # If caps are present, require at least one usable output.
+        if not (outs.get("text") or outs.get("search") or outs.get("image")):
+            return False
+        # ...and if caps are present but organization is empty, still reject.
+        if not org:
+            return False
+        return True
+
+    # No capabilities info at all: require a plausible organization and a
+    # reasonably short name (real model names are almost never >80 chars).
+    if not org:
+        return False
+    if len(pub) > 80:
         return False
     return True
 

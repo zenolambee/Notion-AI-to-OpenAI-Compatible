@@ -36,6 +36,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -227,16 +228,157 @@ def _model_entry_to_dataclass(m: dict[str, Any]) -> ArenaModel:
     )
 
 
+# Alias substrings → (organization filter, publicName substring filter).
+# The best (by 'rank' then publicName length descending) matching entry
+# is picked, so "gpt-4o" resolves to the newest GPT-4o snapshot.
+_MODEL_ALIASES: list[tuple[str, tuple[str, ...], tuple[str, ...]]] = [
+    # alias, org substrings, publicName substrings
+    ("arena-gpt-4o", ("openai",), ("gpt-4o",)),
+    ("gpt-4o", ("openai",), ("gpt-4o",)),
+    ("gpt-4o-mini", ("openai",), ("gpt-4o", "mini")),
+    ("gpt-4-mini", ("openai",), ("gpt-4", "mini")),
+    ("gpt-5-mini", ("openai",), ("gpt-5", "mini")),
+    ("gpt-5-nano", ("openai",), ("gpt-5", "nano")),
+    ("gpt-4", ("openai",), ("gpt-4",)),
+    ("gpt-5", ("openai",), ("gpt-5",)),
+    ("gpt-4-turbo", ("openai",), ("gpt-4-turbo", "gpt-4-1106")),
+    ("gpt-4.1", ("openai",), ("gpt-4.1",)),
+    ("o1", ("openai",), ("o1",)),
+    ("o3", ("openai",), ("o3",)),
+    ("o4", ("openai",), ("o4",)),
+
+    ("arena-claude-3-5-sonnet", ("anthropic",), ("claude-3-5-sonnet",)),
+    ("arena-claude-3-opus", ("anthropic",), ("claude-3-opus",)),
+    ("arena-claude-3-sonnet", ("anthropic",), ("claude-3-sonnet",)),
+    ("arena-claude-3-haiku", ("anthropic",), ("claude-3-haiku",)),
+    ("claude-opus", ("anthropic",), ("claude-opus",)),
+    ("claude-sonnet", ("anthropic",), ("claude-sonnet",)),
+    ("claude-haiku", ("anthropic",), ("claude-haiku",)),
+    ("claude-3-5-sonnet", ("anthropic",), ("claude-3-5-sonnet",)),
+    ("claude-3-opus", ("anthropic",), ("claude-3-opus",)),
+    ("claude-3-haiku", ("anthropic",), ("claude-3-haiku",)),
+    ("claude", ("anthropic",), ("claude",)),
+
+    ("arena-gemini-1.5-pro", ("google",), ("gemini-1.5-pro",)),
+    ("arena-gemini-1.5-flash", ("google",), ("gemini-1.5-flash",)),
+    ("gemini-2.5-pro", ("google",), ("gemini-2.5-pro",)),
+    ("gemini-2.5-flash", ("google",), ("gemini-2.5-flash",)),
+    ("gemini-pro", ("google",), ("gemini", "pro")),
+    ("gemini-flash", ("google",), ("gemini", "flash")),
+    ("gemini", ("google",), ("gemini",)),
+
+    ("arena-llama-3-70b", ("meta",), ("llama-3", "70b")),
+    ("arena-llama-3-8b", ("meta",), ("llama-3", "8b")),
+    ("llama", ("meta",), ("llama",)),
+
+    ("arena-mixtral-8x7b", ("mistral",), ("mixtral-8x7b",)),
+    ("mistral", ("mistral",), ("mistral",)),
+    ("mixtral", ("mistral",), ("mixtral",)),
+
+    ("grok", ("xai",), ("grok",)),
+    ("deepseek", ("deepseek",), ("deepseek",)),
+    ("qwen", ("alibaba", "qwen"), ("qwen",)),
+]
+
+
+_SMALL_VARIANT_MARKERS = ("mini", "nano", "lite", "small", "tiny", "flash-lite")
+
+
+def _extract_date_score(name: str) -> int:
+    """Return YYYYMMDD from a name like 'gpt-4o-2024-11-20' or 0."""
+    m = re.search(r"(20\d{2})[-_]?(\d{2})[-_]?(\d{2})", name)
+    if m:
+        try:
+            return int(m.group(1) + m.group(2) + m.group(3))
+        except Exception:
+            return 0
+    return 0
+
+
+def _score_alias_match(
+    requested_lower: str,
+    entry: dict[str, Any],
+    org_subs: tuple[str, ...],
+    name_subs: tuple[str, ...],
+) -> int | None:
+    """Return a match score (higher = better) or None if doesn't match."""
+    org = str(entry.get("organization") or "").lower()
+    pub = str(entry.get("publicName") or entry.get("name") or "").lower()
+    if not org or not pub:
+        return None
+    if not any(o in org for o in org_subs):
+        return None
+    if not all(s in pub for s in name_subs):
+        return None
+
+    score = 0
+
+    # Prefer newer dated snapshots (gpt-4o-2024-11-20 > gpt-4o-2024-05-13).
+    score += _extract_date_score(pub) * 10
+
+    # Prefer arena's rank when available (lower rank number = better model).
+    rank = entry.get("rank")
+    try:
+        score += -int(rank) * 100_000_000
+    except Exception:
+        pass
+
+    # If the user didn't ask for a small variant, penalize mini/nano/lite.
+    for marker in _SMALL_VARIANT_MARKERS:
+        if marker in pub and marker not in requested_lower:
+            score -= 10_000_000_000
+
+    # Tiebreaker: shorter names are usually the "canonical" alias.
+    score -= len(pub)
+
+    return score
+
+
+def _resolve_alias(
+    requested: str, models: list[dict[str, Any]]
+) -> dict[str, Any] | None:
+    """Try common aliases (arena-gpt-4o, claude, gemini, ...) → best entry."""
+    req = requested.lower().strip()
+    for alias, org_subs, name_subs in _MODEL_ALIASES:
+        if req != alias:
+            continue
+        best: tuple[int, dict[str, Any]] | None = None
+        for m in models:
+            if not isinstance(m, dict):
+                continue
+            score = _score_alias_match(req, m, org_subs, name_subs)
+            if score is None:
+                continue
+            if best is None or score > best[0]:
+                best = (score, m)
+        if best is not None:
+            log.info(
+                "resolved alias %r → %s (org=%s, score=%d)",
+                requested,
+                best[1].get("publicName"),
+                best[1].get("organization"),
+                best[0],
+            )
+            return best[1]
+    return None
+
+
 def _resolve_model(
     requested: str, models: list[dict[str, Any]]
 ) -> tuple[str, dict[str, Any]]:
     """Return (model_uuid, raw_entry) for the requested public name or UUID.
 
-    Raises NotionChatError if not resolvable.
+    Resolution order:
+      1) exact publicName / id match
+      2) case-insensitive publicName match
+      3) alias table (arena-gpt-4o, claude, gemini, llama, mistral, grok…)
+      4) raw UUID passthrough
+    Raises NotionChatError with helpful suggestions if none match.
     """
     if not requested:
         raise NotionChatError("Empty model name", status_code=400)
 
+    # 1) exact match
     for m in models:
         if not isinstance(m, dict):
             continue
@@ -250,26 +392,58 @@ def _resolve_model(
                 )
             return mid, m
 
-    # UUID-shaped input? Trust it.
+    # 2) case-insensitive publicName match
+    req_lower = requested.lower()
+    for m in models:
+        if not isinstance(m, dict):
+            continue
+        pub = str(m.get("publicName") or m.get("name") or "").lower()
+        if pub == req_lower:
+            mid = str(m.get("id") or "")
+            if mid:
+                return mid, m
+
+    # 3) alias table
+    aliased = _resolve_alias(requested, models)
+    if aliased is not None:
+        mid = str(aliased.get("id") or "")
+        if mid:
+            return mid, aliased
+
+    # 4) UUID passthrough
     try:
         uuid.UUID(requested)
         return requested, {"publicName": requested}
     except Exception:
         pass
 
+    # Build helpful hint: suggest names that share tokens with the request.
     available = sorted(
-        {str(m.get("publicName") or "") for m in models if isinstance(m, dict)}
+        {
+            str(m.get("publicName") or "")
+            for m in models
+            if isinstance(m, dict) and m.get("publicName")
+        }
     )
+    tokens = [t for t in re.split(r"[^a-zA-Z0-9]+", req_lower) if len(t) >= 2]
+    scored: list[tuple[int, str]] = []
+    for name in available:
+        low = name.lower()
+        score = sum(1 for t in tokens if t in low)
+        if score:
+            scored.append((score, name))
+    scored.sort(reverse=True)
+    suggestions = [n for _, n in scored[:15]]
     hint = ""
-    if available:
-        hint = (
-            " Available (first 20): "
-            + ", ".join(a for a in available[:20] if a)
-        )
+    if suggestions:
+        hint = " Closest matches: " + ", ".join(suggestions)
+    elif available:
+        hint = " Some available: " + ", ".join(available[:15])
+
     raise NotionChatError(
         f"Model {requested!r} not found in local arena model catalog. "
-        f"Populate {_default_models_path()} with arena.ai's models list, "
-        f"or send a raw arena UUID as the model." + hint,
+        f"Try `notionchat sync-models` to refresh {_default_models_path()}, "
+        f"or send a raw arena UUID." + hint,
         status_code=404,
     )
 
