@@ -32,6 +32,7 @@ Requires the caller to supply, via ArenaAccount / cookies / env:
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
@@ -45,6 +46,7 @@ import httpx
 
 from notionchat.account import ArenaAccount
 from notionchat.exceptions import NotionChatError
+from notionchat.recaptcha import RecaptchaTokenManager
 
 log = logging.getLogger(__name__)
 
@@ -66,6 +68,65 @@ DEFAULT_USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/127.0.0.0 Safari/537.36"
 )
+
+
+# ---------------------------------------------------------------------------
+# Global reCAPTCHA manager (one per account/process)
+# ---------------------------------------------------------------------------
+
+
+def _auto_recaptcha_enabled() -> bool:
+    raw = os.getenv("ARENA_RECAPTCHA_AUTO", "1").strip().lower()
+    return raw not in ("0", "false", "no", "off")
+
+
+_recaptcha_manager: RecaptchaTokenManager | None = None
+_recaptcha_lock = asyncio.Lock()
+
+
+async def _get_recaptcha_manager(account: ArenaAccount) -> RecaptchaTokenManager:
+    global _recaptcha_manager
+    if _recaptcha_manager is not None:
+        return _recaptcha_manager
+    async with _recaptcha_lock:
+        if _recaptcha_manager is None:
+            _recaptcha_manager = RecaptchaTokenManager(account)
+        return _recaptcha_manager
+
+
+async def _acquire_recaptcha_token(
+    account: ArenaAccount, *, force: bool = False
+) -> str:
+    """Return a fresh grecaptcha v3 token.
+
+    Precedence:
+      1) If ARENA_RECAPTCHA_TOKEN env is set, use it as-is (manual mode).
+      2) If ARENA_RECAPTCHA_AUTO is not disabled, mint via Playwright.
+      3) Otherwise return "" and let the upstream 403 surface.
+    """
+    manual = os.getenv("ARENA_RECAPTCHA_TOKEN", "").strip()
+    if manual and not force:
+        return manual
+    if not _auto_recaptcha_enabled():
+        return manual  # possibly empty
+    try:
+        mgr = await _get_recaptcha_manager(account)
+        return await mgr.get_token(force=force)
+    except NotionChatError:
+        raise
+    except Exception as e:
+        log.error("reCAPTCHA auto mint failed: %s", e)
+        return manual  # fall back to manual (maybe empty)
+
+
+async def shutdown_recaptcha() -> None:
+    """Close the shared Playwright browser (call on app shutdown)."""
+    global _recaptcha_manager
+    if _recaptcha_manager is not None:
+        try:
+            await _recaptcha_manager.close()
+        finally:
+            _recaptcha_manager = None
 
 
 # ---------------------------------------------------------------------------
@@ -434,7 +495,12 @@ class ArenaHttpClient:
                 parts.append(f"{cookie_name}={v}")
         return "; ".join(parts)
 
-    def _build_headers(self, *, streaming: bool) -> dict[str, str]:
+    def _build_headers(
+        self,
+        *,
+        streaming: bool,
+        recaptcha_token: str = "",
+    ) -> dict[str, str]:
         ua = self._account.user_agent or DEFAULT_USER_AGENT
         headers: dict[str, str] = {
             # Next.js server actions expect text/plain
@@ -445,7 +511,6 @@ class ArenaHttpClient:
             "User-Agent": ua,
             "Cookie": self._cookie_header(),
         }
-        recaptcha_token = os.getenv("ARENA_RECAPTCHA_TOKEN", "").strip()
         recaptcha_action = os.getenv(
             "ARENA_RECAPTCHA_ACTION", "chat_submit"
         ).strip()
@@ -477,6 +542,7 @@ class ArenaHttpClient:
         model_uuid: str,
         prompt: str,
         modality: str,
+        recaptcha_token: str,
         experimental_attachments: list | None = None,
     ) -> tuple[str, dict[str, Any]]:
         """Build the create-evaluation-session-message payload.
@@ -497,11 +563,79 @@ class ArenaHttpClient:
                 "metadata": {},
             },
             "modality": modality,
-            "recaptchaV3Token": os.getenv("ARENA_RECAPTCHA_TOKEN", "").strip(),
+            "recaptchaV3Token": recaptcha_token,
         }
         return session_id, payload
 
     # ---- core: send one turn ----------------------------------------------
+
+    async def _open_arena_stream(
+        self,
+        *,
+        model_uuid: str,
+        model_public: str,
+        prompt: str,
+        modality: str,
+        force_fresh_recaptcha: bool = False,
+    ):
+        """Open the HTTP stream to arena.ai and return the response context.
+
+        Also returns the resolved session_id and the recaptcha_token used,
+        so callers can retry with a fresh token on 403.
+        """
+        client = await self._get_client()
+
+        recaptcha_token = await _acquire_recaptcha_token(
+            self._account, force=force_fresh_recaptcha
+        )
+        if not recaptcha_token:
+            log.warning(
+                "No reCAPTCHA token available (auto=%s, manual=%s). "
+                "arena.ai will very likely return 403.",
+                _auto_recaptcha_enabled(),
+                bool(os.getenv("ARENA_RECAPTCHA_TOKEN", "").strip()),
+            )
+
+        headers = self._build_headers(
+            streaming=True, recaptcha_token=recaptcha_token
+        )
+        session_id, payload = self._build_create_payload(
+            model_uuid=model_uuid,
+            prompt=prompt,
+            modality=modality,
+            recaptcha_token=recaptcha_token,
+        )
+        url = f"{ARENA_ORIGIN}{STREAM_CREATE_EVALUATION_PATH}"
+        body = json.dumps(payload, ensure_ascii=False)
+
+        log.info(
+            "arena POST %s model=%s(%s) modality=%s prompt_len=%d "
+            "recaptcha=%s(len=%d) force_fresh=%s",
+            url,
+            model_public,
+            model_uuid,
+            modality,
+            len(prompt),
+            "yes" if recaptcha_token else "no",
+            len(recaptcha_token),
+            force_fresh_recaptcha,
+        )
+
+        return (
+            client.stream("POST", url, headers=headers, content=body),
+            session_id,
+            recaptcha_token,
+        )
+
+    def _is_recaptcha_error(self, status_code: int, body: str) -> bool:
+        if status_code != 403:
+            return False
+        lower = body.lower()
+        return (
+            "recaptcha" in lower
+            or "captcha" in lower
+            or "grecaptcha" in lower
+        )
 
     async def _stream_arena(
         self,
@@ -511,85 +645,103 @@ class ArenaHttpClient:
         prompt: str,
         modality: str,
     ) -> AsyncIterator[ArenaStreamChunk]:
-        """Open a POST stream to arena.ai and yield parsed chunks."""
-        client = await self._get_client()
-        headers = self._build_headers(streaming=True)
-        session_id, payload = self._build_create_payload(
-            model_uuid=model_uuid,
-            prompt=prompt,
-            modality=modality,
-        )
-        url = f"{ARENA_ORIGIN}{STREAM_CREATE_EVALUATION_PATH}"
+        """Open a POST stream to arena.ai and yield parsed chunks.
 
-        # Arena's Next.js action expects a JSON string body with
-        # Content-Type text/plain;charset=UTF-8.
-        body = json.dumps(payload, ensure_ascii=False)
+        On a 403 that looks like a reCAPTCHA validation failure, invalidates
+        the cached token and retries once with a freshly minted one.
+        """
+        attempts = 0
+        force_fresh = False
+        max_attempts = 2
 
-        log.info(
-            "arena POST %s model=%s(%s) modality=%s prompt_len=%d",
-            url,
-            model_public,
-            model_uuid,
-            modality,
-            len(prompt),
-        )
-        if not payload["recaptchaV3Token"]:
-            log.warning(
-                "ARENA_RECAPTCHA_TOKEN is empty; arena.ai will very likely "
-                "return 403 'recaptcha validation failed'."
-            )
-
-        try:
-            async with client.stream(
-                "POST", url, headers=headers, content=body
-            ) as resp:
-                log.info(
-                    "arena stream status=%s ct=%s",
-                    resp.status_code,
-                    resp.headers.get("content-type"),
+        while True:
+            attempts += 1
+            try:
+                (
+                    stream_ctx,
+                    session_id,
+                    _token_used,
+                ) = await self._open_arena_stream(
+                    model_uuid=model_uuid,
+                    model_public=model_public,
+                    prompt=prompt,
+                    modality=modality,
+                    force_fresh_recaptcha=force_fresh,
                 )
-                if resp.status_code >= 300:
-                    text_bytes = await resp.aread()
-                    text = text_bytes.decode("utf-8", errors="replace")
-                    log.error(
-                        "arena stream error %s: %s",
+            except httpx.HTTPError as e:
+                raise NotionChatError(
+                    f"arena.ai network error: {e}", status_code=502
+                ) from e
+
+            try:
+                async with stream_ctx as resp:
+                    log.info(
+                        "arena stream status=%s ct=%s",
                         resp.status_code,
-                        text[:800],
+                        resp.headers.get("content-type"),
                     )
-                    raise NotionChatError(
-                        f"arena.ai HTTP {resp.status_code}: {text[:500]}",
-                        status_code=502,
-                    )
+                    if resp.status_code >= 300:
+                        text_bytes = await resp.aread()
+                        text = text_bytes.decode("utf-8", errors="replace")
+                        log.error(
+                            "arena stream error %s: %s",
+                            resp.status_code,
+                            text[:800],
+                        )
+                        # Retry once with a fresh recaptcha token on
+                        # 403-recaptcha responses.
+                        if (
+                            self._is_recaptcha_error(resp.status_code, text)
+                            and attempts < max_attempts
+                            and _auto_recaptcha_enabled()
+                        ):
+                            log.info(
+                                "arena: 403 recaptcha — invalidating token "
+                                "and retrying with a fresh mint."
+                            )
+                            # Nudge the manager to remint.
+                            try:
+                                mgr = await _get_recaptcha_manager(self._account)
+                                mgr.invalidate()
+                            except Exception:
+                                pass
+                            force_fresh = True
+                            continue
+                        raise NotionChatError(
+                            f"arena.ai HTTP {resp.status_code}: {text[:500]}",
+                            status_code=502,
+                        )
 
-                self._sessions[model_public] = session_id
-                sampled: list[str] = []
-                any_content = False
-                async for raw_line in resp.aiter_lines():
-                    if raw_line is None:
-                        continue
-                    if not raw_line.strip():
-                        continue
-                    if len(sampled) < 5:
-                        sampled.append(raw_line[:200])
-                    chunk = _parse_vercel_line(raw_line, model_public)
-                    if chunk is None:
-                        continue
-                    if chunk.content or chunk.reasoning:
-                        any_content = True
-                    yield chunk
-                    if chunk.done:
-                        break
+                    self._sessions[model_public] = session_id
+                    sampled: list[str] = []
+                    any_content = False
+                    async for raw_line in resp.aiter_lines():
+                        if raw_line is None:
+                            continue
+                        if not raw_line.strip():
+                            continue
+                        if len(sampled) < 5:
+                            sampled.append(raw_line[:200])
+                        chunk = _parse_vercel_line(raw_line, model_public)
+                        if chunk is None:
+                            continue
+                        if chunk.content or chunk.reasoning:
+                            any_content = True
+                        yield chunk
+                        if chunk.done:
+                            break
 
-                if not any_content:
-                    log.warning(
-                        "arena stream 200 but 0 content chunks. "
-                        "First lines: %r",
-                        sampled,
-                    )
-        except httpx.HTTPError as e:
-            raise NotionChatError(
-                f"arena.ai network error: {e}", status_code=502
-            ) from e
+                    if not any_content:
+                        log.warning(
+                            "arena stream 200 but 0 content chunks. "
+                            "First lines: %r",
+                            sampled,
+                        )
+                    return
+            except httpx.HTTPError as e:
+                raise NotionChatError(
+                    f"arena.ai network error: {e}", status_code=502
+                ) from e
 
     # ---- public: OpenAI-shaped API ----------------------------------------
 

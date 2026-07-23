@@ -37,6 +37,24 @@ def cmd_serve(_: argparse.Namespace) -> int:
     return 0
 
 
+def _install_playwright_browsers() -> int:
+    """Run `playwright install chromium` in the current interpreter."""
+    import subprocess
+
+    cmd = [sys.executable, "-m", "playwright", "install", "chromium"]
+    print("Running:", " ".join(cmd))
+    try:
+        rc = subprocess.call(cmd)
+    except FileNotFoundError:
+        print(
+            "playwright package not found. Install it first:\n"
+            "  pip install playwright",
+            file=sys.stderr,
+        )
+        return 1
+    return rc
+
+
 def cmd_setup(args: argparse.Namespace) -> int:
     """Run interactive setup."""
     return asyncio.run(
@@ -76,6 +94,13 @@ def main(argv: list[str] | None = None) -> None:
     # serve command
     serve_p = sub.add_parser("serve", help="Start OpenAI-compatible API server")
     serve_p.set_defaults(func=cmd_serve)
+
+    # install-playwright command
+    inst_p = sub.add_parser(
+        "install-playwright",
+        help="Download the headless Chromium used for auto reCAPTCHA minting",
+    )
+    inst_p.set_defaults(func=lambda _: _install_playwright_browsers())
 
     # setup command
     setup_p = sub.add_parser("setup", help="Interactive wizard: cookie -> account file -> .env")

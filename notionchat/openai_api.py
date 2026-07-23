@@ -19,7 +19,9 @@ from pydantic import BaseModel, ConfigDict
 from notionchat.arena_client import (
     ArenaHttpClient,
     ArenaStreamChunk,
+    _acquire_recaptcha_token,
     get_arena_models,
+    shutdown_recaptcha,
 )
 from notionchat.config import Settings, load_account_from_env, load_settings
 from notionchat.exceptions import NotionChatError
@@ -81,7 +83,13 @@ def _chunk(
 
 async def lifespan(app: FastAPI):
     """Application lifespan handler."""
-    yield
+    try:
+        yield
+    finally:
+        try:
+            await shutdown_recaptcha()
+        except Exception as e:
+            log.warning("shutdown_recaptcha error: %s", e)
 
 
 def create_app(settings: Settings | None = None) -> FastAPI:
@@ -107,6 +115,24 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     async def healthz() -> dict[str, str]:
         """Health check endpoint."""
         return {"status": "ok"}
+
+    @app.post("/v1/recaptcha/token")
+    async def mint_recaptcha_token(
+        force: bool = False,
+        _: None = Depends(verify_key),
+    ) -> dict[str, Any]:
+        """Mint (or return the cached) grecaptcha v3 token for debugging."""
+        account = load_account_from_env(settings)
+        try:
+            token = await _acquire_recaptcha_token(account, force=force)
+        except Exception as e:
+            raise HTTPException(status_code=502, detail=str(e)) from e
+        return {
+            "token_len": len(token),
+            "token_preview": (token[:20] + "...") if token else "",
+            "has_token": bool(token),
+            "force": force,
+        }
 
     @app.get("/v1/models")
     async def list_models(_: None = Depends(verify_key)) -> dict[str, Any]:
