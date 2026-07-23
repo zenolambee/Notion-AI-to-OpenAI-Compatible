@@ -11,7 +11,7 @@ from typing import Any, AsyncIterator
 
 import httpx
 
-from notionchat.account import ArenaAccount, ArenaChatMessage
+from notionchat.account import ArenaAccount
 
 log = logging.getLogger(__name__)
 
