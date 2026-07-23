@@ -20,9 +20,17 @@ from notionchat.arena_client import (
     ArenaHttpClient,
     ArenaStreamChunk,
     get_arena_models,
+    sync_arena_models_to_catalog,
 )
 from notionchat.config import Settings, load_account_from_env, load_settings
 from notionchat.exceptions import NotionChatError
+from notionchat.model_catalog import (
+    catalog_is_fresh,
+    closest_model_names,
+    load_catalog,
+    openai_model_list,
+    resolve_model_id,
+)
 
 log = logging.getLogger(__name__)
 
@@ -110,30 +118,27 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     @app.get("/v1/models")
     async def list_models(_: None = Depends(verify_key)) -> dict[str, Any]:
-        """List available models."""
-        account = load_account_from_env(settings)
-        models = DEFAULT_ARENA_MODELS.copy()
+        """List available models.
 
-        try:
-            # Try to fetch real models from arena.ai
-            client = ArenaHttpClient(account)
-            real_models = await client.get_models()
-            await client.close()
+        Tries the local catalog first (fast). If stale or missing, auto-syncs
+        from Arena.ai on the fly.
+        """
+        catalog = load_catalog()
 
-            if real_models:
-                models = [
-                    {
-                        "id": m.id,
-                        "object": "model",
-                        "created": int(time.time()),
-                        "owned_by": m.provider or "arena",
-                        "description": m.description,
-                    }
-                    for m in real_models
-                ]
-                log.info("Fetched %d models from arena.ai", len(models))
-        except Exception as e:
-            log.warning("Could not fetch arena models, using defaults: %s", e)
+        if not catalog_is_fresh(catalog):
+            try:
+                account = load_account_from_env(settings)
+                catalog = await sync_arena_models_to_catalog(account)
+                log.info("Auto-synced model catalog (%d models)", len(catalog.get("models", [])))
+            except Exception as e:
+                log.warning("Could not sync models from arena.ai: %s", e)
+
+        models = openai_model_list(catalog)
+
+        # Fallback to hardcoded defaults if the catalog is truly empty
+        if not models:
+            log.warning("Model catalog empty — falling back to hardcoded defaults")
+            models = DEFAULT_ARENA_MODELS.copy()
 
         return {"object": "list", "data": models}
 
@@ -153,30 +158,69 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 for m in req.messages
             ]
 
+            # ── Model resolution ────────────────────────────────────
+            requested_model = req.model
+            arena_model_id = resolve_model_id(requested_model)
+
+            if arena_model_id is None:
+                # Auto-sync and retry once
+                catalog = load_catalog()
+                try:
+                    catalog = await sync_arena_models_to_catalog(account)
+                except Exception:
+                    pass
+                arena_model_id = resolve_model_id(requested_model, catalog=catalog)
+
+            if arena_model_id is None:
+                await client.close()
+                suggestions = closest_model_names(requested_model)
+                hint = ""
+                if suggestions:
+                    hint = f" Closest matches: {', '.join(suggestions[:10])}"
+                raise HTTPException(
+                    status_code=404,
+                    detail=(
+                        f"Model '{requested_model}' not found in Arena model catalog. "
+                        f"Run `python -m notionchat sync-models` to refresh, "
+                        f"or pass a raw Arena model UUID.{hint}"
+                    ),
+                )
+
             log.info(
-                "chat stream=%s model=%s msgs=%d",
+                "chat stream=%s model=%s→%s msgs=%d",
                 req.stream,
-                req.model,
+                requested_model,
+                arena_model_id,
                 len(messages),
             )
 
             if req.stream:
                 return StreamingResponse(
-                    _stream_response(client, req, settings),
+                    _stream_response(client, ChatCompletionRequest(
+                        model=arena_model_id,
+                        messages=req.messages,
+                        stream=True,
+                        temperature=req.temperature,
+                        max_tokens=req.max_tokens,
+                        top_p=req.top_p,
+                        stop=req.stop,
+                    ), settings),
                     media_type="text/event-stream",
                 )
 
             # Non-streaming
             result = await client.chat_completion(
-                model=req.model,
+                model=arena_model_id,
                 messages=messages,
                 temperature=req.temperature or 1.0,
                 max_tokens=req.max_tokens,
             )
             await client.close()
 
-            return _format_response(result, req.model)
+            return _format_response(result, requested_model)
 
+        except HTTPException:
+            raise
         except NotionChatError as e:
             log.error("Chat completion error: %s", e)
             raise HTTPException(status_code=e.status_code, detail=str(e)) from e

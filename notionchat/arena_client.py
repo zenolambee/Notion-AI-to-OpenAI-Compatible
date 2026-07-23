@@ -316,3 +316,37 @@ async def get_arena_models(account: ArenaAccount) -> list[dict[str, Any]]:
         log.error("Error getting arena models: %s", e)
         await client.close()
         return []
+
+
+async def sync_arena_models_to_catalog(account: ArenaAccount) -> dict[str, Any]:
+    """Fetch the raw model list from Arena and persist it to the local catalog.
+
+    Returns the saved catalog dict (with ``models`` and ``synced_at`` keys).
+    """
+    from notionchat.model_catalog import save_catalog  # noqa: PLC0415
+
+    client = ArenaHttpClient(account)
+    try:
+        resp_models = await client.get_models()
+    finally:
+        await client.close()
+
+    # Convert ArenaModel dataclasses back to plain dicts for JSON serialisation
+    raw_models: list[dict[str, Any]] = []
+    for m in resp_models:
+        entry: dict[str, Any] = {"id": m.id}
+        if m.name:
+            entry["name"] = m.name
+        if m.provider:
+            entry["provider"] = m.provider
+        if m.description:
+            entry["description"] = m.description
+        entry["streaming"] = m.supports_streaming
+        raw_models.append(entry)
+
+    catalog: dict[str, Any] = {
+        "synced_at": __import__("time").time(),
+        "models": raw_models,
+    }
+    save_catalog(catalog)
+    return catalog

@@ -28,6 +28,43 @@ def cmd_serve(_: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_sync_models(_: argparse.Namespace) -> int:
+    """Fetch available models from Arena.ai and save to models.json."""
+    from notionchat.arena_client import sync_arena_models_to_catalog  # noqa: PLC0415
+    from notionchat.config import load_settings as _ls  # noqa: PLC0415
+    from notionchat.config import load_account_from_env as _la  # noqa: PLC0415
+
+    home = os.getenv("ARENACHAT_HOME", "").strip()
+    if home:
+        os.chdir(Path(home).expanduser().resolve())
+
+    settings = _ls()
+    try:
+        account = _la(settings)
+    except Exception as exc:
+        print(f"Error loading account: {exc}", file=sys.stderr)
+        return 1
+
+    print("Fetching models from Arena.ai ...")
+    try:
+        catalog = asyncio.run(sync_arena_models_to_catalog(account))
+    except Exception as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return 1
+
+    count = len(catalog.get("models", []))
+    print(f"Saved {count} models to models.json")
+    if count:
+        print("\nAvailable models:")
+        for entry in catalog["models"]:
+            name = entry.get("name") or entry.get("id")
+            mid = entry.get("id")
+            provider = entry.get("provider", "")
+            suffix = f"  ({provider})" if provider else ""
+            print(f"  {name}  →  {mid}{suffix}")
+    return 0
+
+
 def cmd_setup(args: argparse.Namespace) -> int:
     """Run interactive setup."""
     return asyncio.run(
@@ -85,6 +122,10 @@ def main(argv: list[str] | None = None) -> None:
     setup_p.add_argument("--force", action="store_true", help="Overwrite .env without asking")
     setup_p.add_argument("-y", "--yes", action="store_true", help="Accept defaults with minimal prompts")
     setup_p.set_defaults(func=cmd_setup)
+
+    # sync-models command
+    sync_p = sub.add_parser("sync-models", help="Fetch and cache Arena.ai model list to models.json")
+    sync_p.set_defaults(func=cmd_sync_models)
 
     args = parser.parse_args(argv)
     if not args.command:
