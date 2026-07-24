@@ -29,30 +29,22 @@ def cmd_serve(_: argparse.Namespace) -> int:
 
 
 def cmd_sync_models(_: argparse.Namespace) -> int:
-    """Fetch available models from Arena.ai and save to models.json."""
-    from notionchat.arena_client import sync_arena_models_to_catalog  # noqa: PLC0415
-    from notionchat.config import load_settings as _ls  # noqa: PLC0415
-    from notionchat.config import load_account_from_env as _la  # noqa: PLC0415
+    """Write the known Arena.ai model catalog to models.json."""
+    from notionchat.model_catalog import KNOWN_ARENA_MODELS, save_catalog  # noqa: PLC0415
+    import time as _time  # noqa: PLC0415
 
     home = os.getenv("ARENACHAT_HOME", "").strip()
     if home:
         os.chdir(Path(home).expanduser().resolve())
 
-    settings = _ls()
-    try:
-        account = _la(settings)
-    except Exception as exc:
-        print(f"Error loading account: {exc}", file=sys.stderr)
-        return 1
+    catalog = {
+        "synced_at": _time.time(),
+        "source": "hardcoded",
+        "models": [dict(m) for m in KNOWN_ARENA_MODELS],
+    }
+    save_catalog(catalog)
 
-    print("Fetching models from Arena.ai ...")
-    try:
-        catalog = asyncio.run(sync_arena_models_to_catalog(account))
-    except Exception as exc:
-        print(f"Error: {exc}", file=sys.stderr)
-        return 1
-
-    count = len(catalog.get("models", []))
+    count = len(catalog["models"])
     print(f"Saved {count} models to models.json")
     if count:
         print("\nAvailable models:")

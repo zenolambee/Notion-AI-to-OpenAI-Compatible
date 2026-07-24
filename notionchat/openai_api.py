@@ -120,22 +120,12 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     async def list_models(_: None = Depends(verify_key)) -> dict[str, Any]:
         """List available models.
 
-        Tries the local catalog first (fast). If stale or missing, auto-syncs
-        from Arena.ai on the fly.
+        Uses the local model catalog (hardcoded Arena.ai model names).
+        Run ``python -m notionchat sync-models`` to write models.json.
         """
         catalog = load_catalog()
-
-        if not catalog_is_fresh(catalog):
-            try:
-                account = load_account_from_env(settings)
-                catalog = await sync_arena_models_to_catalog(account)
-                log.info("Auto-synced model catalog (%d models)", len(catalog.get("models", [])))
-            except Exception as e:
-                log.warning("Could not sync models from arena.ai: %s", e)
-
         models = openai_model_list(catalog)
 
-        # Fallback to hardcoded defaults if the catalog is truly empty
         if not models:
             log.warning("Model catalog empty — falling back to hardcoded defaults")
             models = DEFAULT_ARENA_MODELS.copy()

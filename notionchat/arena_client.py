@@ -319,33 +319,21 @@ async def get_arena_models(account: ArenaAccount) -> list[dict[str, Any]]:
 
 
 async def sync_arena_models_to_catalog(account: ArenaAccount) -> dict[str, Any]:
-    """Fetch the raw model list from Arena and persist it to the local catalog.
+    """Sync the local model catalog.
 
-    Returns the saved catalog dict (with ``models`` and ``synced_at`` keys).
+    Since Arena.ai's /api/models returns 403, we use the hardcoded catalog
+    from model_catalog.py. The account parameter is kept for API compatibility
+    but is not used.
     """
-    from notionchat.model_catalog import save_catalog  # noqa: PLC0415
+    from notionchat.model_catalog import KNOWN_ARENA_MODELS, save_catalog  # noqa: PLC0415
 
-    client = ArenaHttpClient(account)
-    try:
-        resp_models = await client.get_models()
-    finally:
-        await client.close()
+    del account  # not needed — we use the hardcoded list
 
-    # Convert ArenaModel dataclasses back to plain dicts for JSON serialisation
-    raw_models: list[dict[str, Any]] = []
-    for m in resp_models:
-        entry: dict[str, Any] = {"id": m.id}
-        if m.name:
-            entry["name"] = m.name
-        if m.provider:
-            entry["provider"] = m.provider
-        if m.description:
-            entry["description"] = m.description
-        entry["streaming"] = m.supports_streaming
-        raw_models.append(entry)
+    raw_models: list[dict[str, Any]] = [dict(m) for m in KNOWN_ARENA_MODELS]
 
     catalog: dict[str, Any] = {
         "synced_at": __import__("time").time(),
+        "source": "hardcoded",
         "models": raw_models,
     }
     save_catalog(catalog)
