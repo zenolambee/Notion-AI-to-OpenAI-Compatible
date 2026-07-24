@@ -21,19 +21,17 @@ from notionchat.exceptions import NotionChatError
 _COOKIE_HELP = """
 How to copy your Arena.ai browser cookie:
 
-  1. Log in at https://arena.ai
-     (On a VPS: log in from a browser that uses the SAME public IP as the server,
-      or set ARENACHAT_PROXY first — cookies may fail trust checks on datacenter IPs.)
+  1. Log in at https://arena.ai and open Direct mode.
 
-  2. Open DevTools (F12) → Application → Cookies → https://arena.ai
+  2. Open DevTools (F12) → Network, select a request to arena.ai, then copy
+     the complete Cookie request-header value.
 
-  3. Select all cookie rows, or run this in the Console tab:
+  3. Paste that full single-line value here. It must include
+     'arena-auth-prod-v1' or the split 'arena-auth-prod-v1.0' / '.1' cookies.
+     Keep any cf_clearance or __cf_bm cookie sent by the browser.
 
-       copy(document.cookie)
-
-  4. Paste the full string here (must include 'arena-auth-prod-v1').
-
-  Note: You may also need the 'cf_clearance' cookie if Cloudflare protection is active.
+  Note: Arena may require reCAPTCHA in the browser. This tool does not solve
+  or bypass CAPTCHA; it reports a clear upstream error when the check fails.
 """.strip()
 
 
@@ -113,12 +111,15 @@ def _render_env(values: dict[str, str]) -> str:
         f"ARENACHAT_HOST={values.get('ARENACHAT_HOST', '127.0.0.1')}",
         f"ARENACHAT_PORT={values.get('ARENACHAT_PORT', '1995')}",
         f"ARENACHAT_ACCOUNT={values.get('ARENACHAT_ACCOUNT', 'arena_account.json')}",
-        f"ARENACHAT_BASE_URL={values.get('ARENACHAT_BASE_URL', 'https://arena.ai/api')}",
+        f"ARENACHAT_BASE_URL={values.get('ARENACHAT_BASE_URL', 'https://arena.ai')}",
         f"ARENACHAT_DEFAULT_MODEL={values.get('ARENACHAT_DEFAULT_MODEL', 'arena-gpt-4o')}",
     ]
     cookie = values.get("ARENA_COOKIE", "").strip()
     if cookie:
         lines.append(f"ARENA_COOKIE={cookie}")
+    recaptcha_token = values.get("ARENA_RECAPTCHA_V3_TOKEN", "").strip()
+    if recaptcha_token:
+        lines.append(f"ARENA_RECAPTCHA_V3_TOKEN={recaptcha_token}")
     lines.append("")
     return "\n".join(lines)
 

@@ -4,7 +4,6 @@ OpenAI-compatible API for Arena.ai (Chatbot Arena).
 
 from __future__ import annotations
 
-import asyncio
 import json
 import logging
 import time
@@ -16,31 +15,14 @@ from fastapi import Depends, FastAPI, Header, HTTPException
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, ConfigDict
 
-from notionchat.arena_client import (
-    ArenaHttpClient,
-    ArenaStreamChunk,
-    get_arena_models,
-)
+from notionchat.arena_client import ArenaHttpClient
 from notionchat.config import Settings, load_account_from_env, load_settings
 from notionchat.exceptions import NotionChatError
 
 log = logging.getLogger(__name__)
 
-# Default arena models
-DEFAULT_ARENA_MODELS = [
-    {"id": "arena-gpt-4o", "object": "model", "created": 1700000000, "owned_by": "openai", "description": "GPT-4o via Arena.ai"},
-    {"id": "arena-claude-3-5-sonnet", "object": "model", "created": 1700000000, "owned_by": "anthropic", "description": "Claude 3.5 Sonnet via Arena.ai"},
-    {"id": "arena-gemini-1.5-pro", "object": "model", "created": 1700000000, "owned_by": "google", "description": "Gemini 1.5 Pro via Arena.ai"},
-    {"id": "arena-claude-3-opus", "object": "model", "created": 1700000000, "owned_by": "anthropic", "description": "Claude 3 Opus via Arena.ai"},
-    {"id": "arena-gpt-4-turbo", "object": "model", "created": 1700000000, "owned_by": "openai", "description": "GPT-4 Turbo via Arena.ai"},
-    {"id": "arena-gpt-4", "object": "model", "created": 1700000000, "owned_by": "openai", "description": "GPT-4 via Arena.ai"},
-    {"id": "arena-claude-3-sonnet", "object": "model", "created": 1700000000, "owned_by": "anthropic", "description": "Claude 3 Sonnet via Arena.ai"},
-    {"id": "arena-claude-3-haiku", "object": "model", "created": 1700000000, "owned_by": "anthropic", "description": "Claude 3 Haiku via Arena.ai"},
-    {"id": "arena-gemini-1.5-flash", "object": "model", "created": 1700000000, "owned_by": "google", "description": "Gemini 1.5 Flash via Arena.ai"},
-    {"id": "arena-llama-3-70b", "object": "model", "created": 1700000000, "owned_by": "meta", "description": "Llama 3 70B via Arena.ai"},
-    {"id": "arena-llama-3-8b", "object": "model", "created": 1700000000, "owned_by": "meta", "description": "Llama 3 8B via Arena.ai"},
-    {"id": "arena-mixtral-8x7b", "object": "model", "created": 1700000000, "owned_by": "mistral", "description": "Mixtral 8x7B via Arena.ai"},
-]
+# Models are discovered from the logged-in Arena direct-mode page.  Do not
+# advertise a stale hard-coded list: those names cannot be sent to Arena.
 
 
 class ChatMessage(BaseModel):
@@ -84,6 +66,15 @@ async def lifespan(app: FastAPI):
     yield
 
 
+def _new_arena_client(account, settings: Settings) -> ArenaHttpClient:
+    """Construct a client with settings shared by model and chat endpoints."""
+    return ArenaHttpClient(
+        account,
+        base_url=settings.base_url,
+        recaptcha_v3_token=settings.recaptcha_v3_token,
+    )
+
+
 def create_app(settings: Settings | None = None) -> FastAPI:
     """Create FastAPI application."""
     settings = settings or load_settings()
@@ -110,31 +101,25 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     @app.get("/v1/models")
     async def list_models(_: None = Depends(verify_key)) -> dict[str, Any]:
-        """List available models."""
+        """List models enabled for the authenticated Arena direct-mode session."""
         account = load_account_from_env(settings)
-        models = DEFAULT_ARENA_MODELS.copy()
-
+        client = _new_arena_client(account, settings)
         try:
-            # Try to fetch real models from arena.ai
-            client = ArenaHttpClient(account)
             real_models = await client.get_models()
+        finally:
             await client.close()
 
-            if real_models:
-                models = [
-                    {
-                        "id": m.id,
-                        "object": "model",
-                        "created": int(time.time()),
-                        "owned_by": m.provider or "arena",
-                        "description": m.description,
-                    }
-                    for m in real_models
-                ]
-                log.info("Fetched %d models from arena.ai", len(models))
-        except Exception as e:
-            log.warning("Could not fetch arena models, using defaults: %s", e)
-
+        models = [
+            {
+                "id": model.id,
+                "object": "model",
+                "created": int(time.time()),
+                "owned_by": model.provider or "arena",
+                "description": model.description,
+            }
+            for model in real_models
+        ]
+        log.info("Fetched %d models from arena.ai", len(models))
         return {"object": "list", "data": models}
 
     @app.post("/v1/chat/completions")
@@ -143,46 +128,45 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         _: None = Depends(verify_key),
     ) -> Any:
         """Handle chat completion requests."""
+        client: ArenaHttpClient | None = None
         try:
             account = load_account_from_env(settings)
-            client = ArenaHttpClient(account)
+            client = _new_arena_client(account, settings)
 
-            # Convert messages
             messages = [
-                {"role": m.role, "content": m.content or ""}
-                for m in req.messages
+                {"role": message.role, "content": message.content or ""}
+                for message in req.messages
             ]
-
-            log.info(
-                "chat stream=%s model=%s msgs=%d",
-                req.stream,
-                req.model,
-                len(messages),
-            )
+            log.info("chat stream=%s model=%s msgs=%d", req.stream, req.model, len(messages))
 
             if req.stream:
+                # The generator owns and closes this client after the response.
                 return StreamingResponse(
-                    _stream_response(client, req, settings),
+                    _stream_response(client, req),
                     media_type="text/event-stream",
                 )
 
-            # Non-streaming
             result = await client.chat_completion(
                 model=req.model,
                 messages=messages,
                 temperature=req.temperature or 1.0,
                 max_tokens=req.max_tokens,
+                top_p=req.top_p,
+                stop=req.stop,
             )
-            await client.close()
-
             return _format_response(result, req.model)
 
         except NotionChatError as e:
             log.error("Chat completion error: %s", e)
             raise HTTPException(status_code=e.status_code, detail=str(e)) from e
         except Exception as e:
-            log.error("Unexpected error: %s", e)
-            raise HTTPException(status_code=500, detail=str(e)) from e
+            log.exception("Unexpected error during chat completion")
+            raise HTTPException(status_code=500, detail="Internal server error") from e
+        finally:
+            # StreamingResponse consumes the generator after this route returns,
+            # so its client is closed by _stream_response instead.
+            if client is not None and not req.stream:
+                await client.close()
 
     return app
 
@@ -190,16 +174,16 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 async def _stream_response(
     client: ArenaHttpClient,
     req: ChatCompletionRequest,
-    settings: Settings,
 ) -> AsyncIterator[str]:
     """Stream chat completion response."""
     completion_id = f"chatcmpl-{uuid.uuid4().hex[:24]}"
     created = int(time.time())
 
+    sent_finish = False
     try:
         messages = [
-            {"role": m.role, "content": m.content or ""}
-            for m in req.messages
+            {"role": message.role, "content": message.content or ""}
+            for message in req.messages
         ]
 
         async for chunk in client.chat_completion_stream(
@@ -207,6 +191,8 @@ async def _stream_response(
             messages=messages,
             temperature=req.temperature or 1.0,
             max_tokens=req.max_tokens,
+            top_p=req.top_p,
+            stop=req.stop,
         ):
             if chunk.content:
                 yield _chunk(
@@ -215,7 +201,8 @@ async def _stream_response(
                     model=req.model,
                     delta={"content": chunk.content},
                 )
-            if chunk.done:
+            if chunk.done and not sent_finish:
+                sent_finish = True
                 yield _chunk(
                     completion_id=completion_id,
                     created=created,
@@ -224,11 +211,20 @@ async def _stream_response(
                     finish_reason=chunk.finish_reason or "stop",
                 )
 
+        if not sent_finish:
+            yield _chunk(
+                completion_id=completion_id,
+                created=created,
+                model=req.model,
+                delta={},
+                finish_reason="stop",
+            )
         yield "data: [DONE]\n\n"
 
     except NotionChatError as e:
         err = {"error": {"message": str(e), "type": "arena_error", "code": e.status_code}}
         yield f"data: {json.dumps(err)}\n\n"
+        yield "data: [DONE]\n\n"
     finally:
         await client.close()
 

@@ -62,10 +62,10 @@ Client (Cursor / 9router / Postman)
         │
         ▼
   ArenaChat (FastAPI)
-        │  OpenAI messages → Arena.ai API
+        │  OpenAI messages → one direct-mode prompt
         ▼
-  Arena.ai API /api/chat
-        │
+  Arena.ai /nextjs-api/stream/create-evaluation
+        │  Arena event records (a0 / ad / a3)
         ▼
   ArenaChat parses response → OpenAI chat.completion
 ```
@@ -109,17 +109,19 @@ Edit `.env`:
 | `ARENACHAT_HOST` | Bind host (default `127.0.0.1`) |
 | `ARENACHAT_PORT` | Port (default `1995`) |
 | `ARENACHAT_ACCOUNT` | Path to account JSON (default `arena_account.json`) |
-| `ARENACHAT_BASE_URL` | Arena API base URL (default `https://arena.ai/api`) |
-| `ARENACHAT_DEFAULT_MODEL` | Default model ID |
+| `ARENACHAT_BASE_URL` | Arena website origin (default `https://arena.ai`) |
+| `ARENACHAT_DEFAULT_MODEL` | Convenience default; use an ID returned by `/v1/models` |
 | `ARENACHAT_HOME` | Optional — absolute project folder |
-| `ARENA_COOKIE` | Full `document.cookie` from arena.ai |
-| `ARENACHAT_PROXY` | Optional — HTTP/SOCKS proxy for Arena egress |
+| `ARENA_COOKIE` | Full **Cookie request header** from a logged-in arena.ai tab |
+| `ARENA_RECAPTCHA_V3_TOKEN` | Optional, short-lived token from your normal browser request if Arena requires it |
 
 ### 3. Get your Arena.ai cookie
 
-1. Log in to [arena.ai](https://arena.ai)
-2. Open DevTools (F12) → **Application** → **Cookies** → `https://arena.ai`
-3. Copy the full cookie string (must include `arena-auth-prod-v1`)
+1. Log in to [arena.ai](https://arena.ai) and open **Direct mode**.
+2. In DevTools (F12), open **Network**, select a request to `arena.ai`, and copy its complete **Cookie** request-header value.
+3. It must contain `arena-auth-prod-v1` or its split `arena-auth-prod-v1.0`/`.1` cookies. Keep any `cf_clearance` or `__cf_bm` cookies sent by the browser too.
+
+> Arena can enforce a browser reCAPTCHA check for a request. Complete it in your normal browser. This project deliberately does not solve or bypass CAPTCHA; if the upstream returns a reCAPTCHA rejection, the API now reports that explicitly instead of returning an empty assistant message.
 
 ```bash
 python -m notionchat setup
@@ -149,7 +151,7 @@ curl http://127.0.0.1:1995/healthz
 curl http://127.0.0.1:1995/v1/models \
   -H "Authorization: Bearer sk-arena-chat"
 
-# Chat completion (non-streaming)
+# Chat completion (non-streaming) — replace the model with an ID from /v1/models
 curl http://127.0.0.1:1995/v1/chat/completions \
   -H "Authorization: Bearer sk-arena-chat" \
   -H "Content-Type: application/json" \
@@ -171,20 +173,14 @@ curl http://127.0.0.1:1995/v1/chat/completions \
 
 ## Available Models
 
-| Model ID | Description |
-|----------|-------------|
-| `arena-gpt-4o` | GPT-4o |
-| `arena-claude-3-5-sonnet` | Claude 3.5 Sonnet |
-| `arena-gemini-1.5-pro` | Gemini 1.5 Pro |
-| `arena-claude-3-opus` | Claude 3 Opus |
-| `arena-gpt-4-turbo` | GPT-4 Turbo |
-| `arena-gpt-4` | GPT-4 |
-| `arena-claude-3-sonnet` | Claude 3 Sonnet |
-| `arena-claude-3-haiku` | Claude 3 Haiku |
-| `arena-gemini-1.5-flash` | Gemini 1.5 Flash |
-| `arena-llama-3-70b` | Llama 3 70B |
-| `arena-llama-3-8b` | Llama 3 8B |
-| `arena-mixtral-8x7b` | Mixtral 8x7B |
+Arena's enabled models change frequently. Do **not** rely on the old `arena-*` table: request the current list after configuring your cookie and use an exact returned `id`.
+
+```bash
+curl http://127.0.0.1:1995/v1/models \
+  -H "Authorization: Bearer sk-arena-chat"
+```
+
+For convenience, a request such as `arena-gpt-4o` is normalized to `GPT-4o` when that model is currently present. The current `/v1/models` result remains the source of truth.
 
 ## Cursor / 9router setup
 
@@ -192,7 +188,7 @@ curl http://127.0.0.1:1995/v1/chat/completions \
 2. In your router or Cursor custom model settings:
    - **Base URL:** `http://127.0.0.1:1995/v1`
    - **API key:** value of `ARENACHAT_API_KEY` from `.env` (default: `sk-arena-chat`)
-   - **Model:** e.g. `arena-gpt-4o`
+   - **Model:** an exact ID returned by `GET /v1/models`
 
 ## Project layout
 
@@ -215,10 +211,11 @@ requirements.txt
 
 | Problem | Things to try |
 |---------|---------------|
-| Empty assistant response | Refresh cookie; check if Arena.ai is accessible |
-| 401 Unauthorized | Verify `ARENACHAT_API_KEY` matches in .env and client |
-| Cookie expired | Re-login to arena.ai and update `ARENA_COOKIE` |
-| Cloudflare challenge | May need `cf_clearance` cookie along with `arena-auth-prod-v1` |
+| Empty assistant response from an older server | Update/restart the server. The current version returns the upstream error instead of a false successful empty completion. |
+| 401 Unauthorized | Verify `ARENACHAT_API_KEY` matches in `.env` and the client. |
+| Arena authentication rejected | Re-login to arena.ai and replace `ARENA_COOKIE` with the full Cookie request header. |
+| “reCAPTCHA check was not accepted” | Complete the challenge in your normal browser, refresh the session, and retry. This proxy does not bypass CAPTCHA. |
+| Model unavailable | Call `GET /v1/models` and use an exact returned model ID. |
 
 Enable server logging:
 

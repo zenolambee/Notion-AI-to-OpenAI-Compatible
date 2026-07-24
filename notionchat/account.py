@@ -55,9 +55,17 @@ def validate_arena_cookie(cookie: str) -> tuple[bool, str]:
 
     parsed = parse_browser_cookie(cookie)
 
-    # Check for arena-auth-prod-v1 cookie
-    if not parsed.get("arena-auth-prod-v1"):
-        return False, "Cookie is missing 'arena-auth-prod-v1'. Copy the full document.cookie from arena.ai."
+    # Google/OAuth sessions can split the large cookie into .0 and .1 parts.
+    # Keep the full cookie header intact when forwarding it to Arena.
+    if not (
+        parsed.get("arena-auth-prod-v1")
+        or parsed.get("arena-auth-prod-v1.0")
+    ):
+        return (
+            False,
+            "Cookie is missing 'arena-auth-prod-v1' (or its .0/.1 split form). "
+            "Copy the full Cookie request header from arena.ai.",
+        )
 
     return True, ""
 
@@ -225,13 +233,19 @@ def build_cookie_header(acc: ArenaAccount) -> str:
 
 
 def create_account_from_cookie(cookie: str) -> ArenaAccount:
-    """Create an ArenaAccount from a cookie string."""
+    """Create an ArenaAccount from a full Arena Cookie request header."""
     parsed = parse_browser_cookie(cookie)
     token = parsed.get("arena-auth-prod-v1") or ""
+    if not token:
+        # The full_cookie is still forwarded unchanged.  token_v2 only exists
+        # as a fallback for callers that have a single, unsplit cookie value.
+        token = combine_split_arena_cookies(
+            [{"name": name, "value": value} for name, value in parsed.items()]
+        ) or ""
 
     if not token:
         raise NotionChatError(
-            "Cookie is missing 'arena-auth-prod-v1'.",
+            "Cookie is missing 'arena-auth-prod-v1' (or arena-auth-prod-v1.0/.1).",
             status_code=400,
         )
 
